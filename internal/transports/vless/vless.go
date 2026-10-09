@@ -93,6 +93,10 @@ const (
 	SettingServerName = "serverName"
 	// SettingInsecureSkipVerify accepts any server certificate.
 	SettingInsecureSkipVerify = "insecure"
+	// SettingCertFingerprint pins the SHA-256 fingerprint of the relay's leaf
+	// certificate. It replaces insecure: true for a self-signed relay and takes
+	// precedence over it when both are set.
+	SettingCertFingerprint = "certFingerprint"
 	// SettingTLS wraps the stream in TLS. Default true; VLESS without TLS is
 	// unencrypted.
 	SettingTLS = "tls"
@@ -162,6 +166,18 @@ func (d Dialer) Dial(ctx context.Context, req transport.DialRequest) (transport.
 		sni = req.Settings.GetString(SettingServerName, host)
 	}
 
+	// The pin is resolved before the socket is opened, and outside the TLS
+	// branch, so a mistyped fingerprint is reported as a configuration error
+	// rather than as a certificate mismatch from a relay that was never at
+	// fault. Validating it even when the TLS wrapper is switched off is
+	// deliberate: the setting is still wrong, and the operator would otherwise
+	// discover it only on the day they turned TLS back on.
+	certPolicy, err := transport.ResolveClientCertPolicy(req.Settings, SettingCertFingerprint,
+		req.Settings.GetBool(SettingInsecureSkipVerify, true))
+	if err != nil {
+		return nil, err
+	}
+
 	raw, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", req.ServerAddr)
 	if err != nil {
 		return nil, err
@@ -173,14 +189,16 @@ func (d Dialer) Dial(ctx context.Context, req transport.DialRequest) (transport.
 
 	var conn net.Conn = raw
 	if req.Settings.GetBool(SettingTLS, true) {
-		tc := tls.Client(raw, &tls.Config{
+		cfg := &tls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: req.Settings.GetBool(SettingInsecureSkipVerify, true),
+			InsecureSkipVerify: certPolicy.InsecureSkipVerify,
 			MinVersion:         minVersion(req.Settings.GetString(SettingMinVersion, "1.2")),
 			// Vision requires ALPN h2 so the outer TLS session looks like an
 			// HTTP/2 connection, which is what a browser would negotiate.
 			NextProtos: []string{"h2", "http/1.1"},
-		})
+		}
+		cfg.VerifyConnection = certPolicy.VerifyConnection()
+		tc := tls.Client(raw, cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			raw.Close()
 			return nil, fmt.Errorf("vless: TLS handshake with %s: %w", req.ServerAddr, err)
@@ -282,6 +300,9 @@ func (h Handler) Handle(ctx context.Context, raw net.Conn, req transport.HandleR
 			raw.Close()
 			return nil, err
 		}
+		// Report the fingerprint once so an operator can copy it into a
+		// client's certFingerprint setting instead of reaching for insecure.
+		transport.LogCertificateFingerprint(loggerFor(req.Logger), cert)
 		tc := tls.Server(raw, &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   minVersion(req.Settings.GetString(SettingMinVersion, "1.2")),

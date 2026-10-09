@@ -302,7 +302,7 @@ porttransit deploy --host 1.2.3.4 --user root \
         "enabled": true,
         "group": "primary",
         "latencyTag": "日本→上海→美国",
-        "settings": { "psk": "base64:...", "insecure": true, "fingerprint": "random-no-alpn" }
+        "settings": { "psk": "base64:...", "certFingerprint": "AA:BB:CC:...", "fingerprint": "random-no-alpn" }
       },
       {
         "id": "srv-backup",
@@ -379,6 +379,44 @@ porttransit deploy --host 1.2.3.4 --user root \
 > 随机档位那样有约 15% 的握手失败率（那两档会声明 X25519MLKEM768 却不发对应
 > 的 key share，服务端回 HelloRetryRequest 后 uTLS 无法应答）。
 
+### 证书指纹固定（certFingerprint）
+
+`tls` / `vless` / `vmess` / `trojan` 四个协议都支持客户端设置
+`certFingerprint`，用来固定中转服务端证书的 SHA-256 指纹：
+
+```json
+"settings": { "psk": "base64:...", "certFingerprint": "AA:BB:CC:..." }
+```
+
+不填就是原来的行为，不影响已有配置。
+
+**自签证书请用 `certFingerprint`，不要用 `insecure: true`。**
+
+`insecure: true` 是真的**完全不校验证书**：任何一台中间人都能拿自己的证书
+冒充你的中转机，客户端不会有任何察觉。而 `certFingerprint` 会在每次连接时
+比对中转服务端出示的证书指纹，不一致就直接断开，中间人换不了证书。
+
+指纹从哪里来：
+
+```bash
+# 在中转机上，直接读证书文件
+porttransit fingerprint --cert /etc/porttransit/certs/relay.crt
+
+# 在客户端上，直接从运行中的中转服务端读取
+porttransit fingerprint --server relay.example.com:8443
+```
+
+服务端启动后的日志里也会打一次自己的指纹，方便直接抄给客户端。
+
+输入格式很宽松：大小写随意，冒号、短横线、空格都可以带也可以不带，
+`AA:BB:CC`、`aabbcc`、`aa-bb-cc` 三者等价。但如果长度不对或者含有非十六进制
+字符，客户端会**直接报错**而不是当作「没配置指纹」继续连接——打错一个字符
+反而变成不校验，是这里最不能接受的失败方式。
+
+同时配了 `certFingerprint` 和 `insecure: true` 时，**以 `certFingerprint`
+为准**。指纹固定比「接受一切」强得多，如果因为 `insecure` 而把它跳过，配了
+指纹的人会以为自己被固定住了，实际上什么都没校验。
+
 判定顺序是 **拦截 → 直连 → 中转**。`proxyRules` 非空时它是白名单，
 没命中的走直连（而不是丢弃，否则用户会以为是断网）。
 
@@ -395,8 +433,30 @@ UDP 隧道按「本地源地址」维护独立的上游会话：同一个本地�
 数据包复用一条中转连接，空闲 60 秒自动回收，因此不会为每个数据包做一次
 握手。
 
-注意：UDP 转发依赖中转协议本身能承载数据报。当前只有 `socks5` 传输实现了
-UDP 关联命令，其余传输请使用 TCP，或改用本地 SOCKS5 代理。
+UDP 转发依赖中转协议本身能承载数据报。`socks5`、`vless`、`vmess`、`trojan`
+显式实现了 UDP 关联命令；`direct` 通过前导帧承载（已由测试覆盖）。
+`shadowsocks`、`ws`、`httpupgrade`、REALITY 请使用 TCP。
+
+### 浏览器代理的 UDP（DNS 与 QUIC）
+
+上面的固定端口转发只能钉死一个目标。如果希望**浏览器**通过代理发 DNS 查询
+或走 QUIC/HTTP3，需要本地 SOCKS5 代理支持 `UDP ASSOCIATE`：
+
+```json
+"proxy": { "enabled": true, "udp": true, "socks5Listen": "127.0.0.1:1080" }
+```
+
+或者直接在控制台的设置页打开。不开启时，SOCKS5 会对 UDP ASSOCIATE 回
+`0x07`，浏览器只能退回 TCP 并用系统解析器——**那会泄漏你正在访问的域名**，
+所以需要隐藏访问目标时应当开启。
+
+开启后：
+
+- 每个客户端 TCP 控制连接对应一个 UDP 关联，控制连接断开即回收。
+- 同一个目标地址复用一条中转流，不会为每个数据包握手。
+- 关联绑定到控制连接的对端地址，其他本机进程无法注入或窃听。
+- 分片（`FRAG != 0`）的数据包会被丢弃：重组是放大攻击面，而浏览器不使用它。
+- 目的地址仍然受分流规则约束（直连 / 走中转 / 拦截）。
 
 ---
 
@@ -498,6 +558,9 @@ cat /etc/sysctl.d/99-porttransit.conf
 - 域名解析后会**再查一次**解析结果，防 DNS rebinding。
 - 简单传输的前导帧带 HMAC 和防重放；没有密钥的探测者什么都拿不到。
 - Shadowsocks-2022 校验时间戳窗口，抓包重放无效。
+- `tls` / `vless` / `vmess` / `trojan` 支持用 `certFingerprint` 固定中转服务端
+  证书的 SHA-256 指纹，中间人换证书会被直接拒绝；配置了指纹时它优先于
+  `insecure`。指纹格式写错会报错而不是静默跳过校验。
 - 控制台 API 不回显密钥。
 - systemd 单元限制了能力集、只读挂载、禁止提权。
 
@@ -507,8 +570,9 @@ cat /etc/sysctl.d/99-porttransit.conf
 - **凭据要保管好**。中转服务端能访问的网段，拿到凭据的人也能访问。
 - **控制台默认只监听本机**。要远程访问，请用 SSH 端口转发，而不是
   直接开放端口。
-- 自签证书需要客户端 `insecure: true` 或指纹校验。如果中转机有域名，
-  建议签一张真证书。
+- **自签证书请固定指纹，不要用 `insecure: true`**。`insecure` 是真的不校验
+  任何证书，中间人可以直接冒充中转机；只有 `certFingerprint` 才有实际防护，
+  见上面的「证书指纹固定」。如果中转机有域名，建议签一张真证书。
 
 ---
 
@@ -605,6 +669,52 @@ scripts/install.sh        一键脚本
 ---
 
 ## 更新日志
+
+### v1.0.1
+
+**性能**
+
+- **内核网络调优**：安装时自动开启 BBR 并调整缓冲区、连接队列、本地端口范围等
+  15 项参数，写入独立的 `/etc/sysctl.d/99-porttransit.conf`。跨国线路的主要
+  瓶颈是丢包，默认的 CUBIC 一遇丢包就把窗口砍半，BBR 不会——这是所有优化里
+  提升最明显的一项。
+  - 新增 `porttransit tune` 命令：`--show` 预览、`--no-persist` 只本次生效、
+    `--revert` 删除配置文件；`install.sh --skip-tune` 可跳过。
+  - 逐项独立应用并**读回校验**：容器里只读的参数会如实报告，而不是把没生效的
+    报成成功。
+
+**修复**
+
+- **客户端账号策略之前完全不生效**：`server.clients` 里的 `enabled`、
+  `maxConnections`、`rateLimitKBps`、`quotaBytes`、`expiresAt` 五个字段
+  配置了但从未被检查——「停用」一个客户端后它照样能用。现在全部生效：
+  - 停用 / 到期 / 配额用尽 / 并发超限都会拒绝连接，并在日志里说明原因。
+  - 一旦配置了账号，**未知的 clientId 会被拒绝**。否则任何人换一个 id 就能
+    绕过按客户端的策略，账号功能形同虚设。
+  - 用量会持久化到 `dataDir/quota.json`（0600），重启不清零——否则客户端
+    等一次重部署就能重置配额。
+  - 控制台新增 `/api/v1/accounts`，可查看每个账号的实时并发与累计流量，
+    并可重置配额。
+- **`server.masking` 配置了但从未应用**：整个 masking 块只被校验、从不生效，
+  运营商以为探测处理好了其实没有。现在会合并进 listener 的传输参数
+  （listener 自己的设置优先），并对不支持 fallback 的协议给出警告。
+- **`resolver` 的自定义 DNS 从未生效**：`servers` / `protocol` / `timeout`
+  三个字段之前只用于 `strategy` 判断。现在真正生效，并修掉一个括号 IPv6
+  地址被双重加括号导致无法解析的缺陷。
+- **`tcpFastOpen` / `mptcp` 从未生效**：现在通过 `ListenConfig.Control` 在
+  **bind 之前**设置（对已监听的 socket 设置 TFO 是无效的），非 Linux 平台
+  会明确告知已忽略而不是静默失效。
+- **入站 PROXY protocol 从未生效**：`listener.proxyProtocol` 之前只是配置项。
+  现在支持 v1/v2 解析，让中转机在负载均衡后面也能看到真实客户端地址。
+- **浏览器代理现在支持 UDP**：本地 SOCKS5 之前对 `UDP ASSOCIATE` 直接回
+  `0x07`，导致浏览器无法通过代理发 DNS 或走 QUIC——只能退回 TCP 并用系统
+  解析器，**这会泄漏正在访问的域名**。`client.proxy.udp` 现在生效。
+- 修正 README 中关于 UDP 支持范围的过时描述（`direct` 通过前导帧也支持）。
+
+**安全**
+
+- 证书指纹 pin：`settings.certFingerprint`，让自签证书的中转不再必须用
+  `insecure: true`（那等于完全不校验服务端）。
 
 ### v1.0.0 — 首个版本
 

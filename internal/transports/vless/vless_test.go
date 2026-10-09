@@ -1387,6 +1387,7 @@ func TestSettingsKeysAreStable(t *testing.T) {
 		SettingFlow:               "flow",
 		SettingServerName:         "serverName",
 		SettingInsecureSkipVerify: "insecure",
+		SettingCertFingerprint:    "certFingerprint",
 		SettingTLS:                "tls",
 		SettingCertFile:           "certFile",
 		SettingKeyFile:            "keyFile",

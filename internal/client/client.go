@@ -55,6 +55,10 @@ type Client struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started atomic.Bool
+
+	// udpAssocs counts the live SOCKS5 UDP associations, so a local process
+	// cannot exhaust descriptors by opening associations in a loop.
+	udpAssocs atomic.Int64
 }
 
 // tunnelHandle is one bound local forwarding listener.

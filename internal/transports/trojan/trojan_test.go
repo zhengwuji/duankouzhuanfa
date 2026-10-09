@@ -960,6 +960,7 @@ func TestSettingsKeysAreStable(t *testing.T) {
 		SettingPassword:           "password",
 		SettingServerName:         "serverName",
 		SettingInsecureSkipVerify: "insecure",
+		SettingCertFingerprint:    "certFingerprint",
 		SettingCertFile:           "certFile",
 		SettingKeyFile:            "keyFile",
 		SettingFallbackAddr:       "fallbackAddr",

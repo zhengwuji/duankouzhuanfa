@@ -104,6 +104,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"listeners": s.relay.ListenerStatuses(),
 			"forwards":  len(s.cfg.Server.Forwards),
 			"clients":   len(s.cfg.Server.Clients),
+			// Per-account usage is what makes the account limits visible: an
+			// operator who set a quota needs to see how much is left, and one
+			// who did not set any should still see who is connected.
+			"accountUsage": s.relay.AccountUsage(),
 		}
 	}
 	if s.cli != nil {
@@ -118,6 +122,66 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // startedAt anchors the uptime the status endpoint reports.
 var startedAt = time.Now()
+
+// handleAccounts reports per-client usage, and resets a client's accumulated
+// quota on DELETE.
+//
+// Resetting is exposed because a quota that has been used up is otherwise a
+// dead end: the operator's only recourse would be editing the persisted file by
+// hand, which is exactly the kind of step that goes wrong at 3am.
+func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	if s.relay == nil {
+		writeError(w, http.StatusNotFound, "not_found", "this instance is not running a relay")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": s.relay.AccountUsage()})
+
+	case http.MethodDelete, http.MethodPost:
+		// The account id comes from the query string rather than the body so a
+		// reset is expressible with curl -X DELETE without a payload. An empty
+		// id means "every account", which is the bulk reset after a billing
+		// period rolls over.
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if id == "" {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"id is required; use /api/v1/accounts/reset to clear every account")
+			return
+		}
+		n := s.relay.ResetAccountUsage(id)
+		if n == 0 {
+			writeError(w, http.StatusNotFound, "not_found", "no account with id %q", id)
+			return
+		}
+		s.log.Info("client quota usage reset",
+			"client", id,
+			"remote", clientIP(r, s.cfg.WebUI.TrustedProxies))
+		writeJSON(w, http.StatusOK, map[string]any{"reset": n, "accounts": s.relay.AccountUsage()})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			"accounts supports GET and DELETE")
+	}
+}
+
+// handleAccountsReset clears every account's usage at once.
+func (s *Server) handleAccountsReset(w http.ResponseWriter, r *http.Request) {
+	if s.relay == nil {
+		writeError(w, http.StatusNotFound, "not_found", "this instance is not running a relay")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "resetting requires POST")
+		return
+	}
+	n := s.relay.ResetAccountUsage("")
+	s.log.Info("all client quota usage reset",
+		"accounts", n,
+		"remote", clientIP(r, s.cfg.WebUI.TrustedProxies))
+	writeJSON(w, http.StatusOK, map[string]any{"reset": n, "accounts": s.relay.AccountUsage()})
+}
 
 // handleConfig returns the configuration with secrets redacted.
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

@@ -189,8 +189,20 @@ func CertificateFingerprint(cert *x509.Certificate) string {
 	if cert == nil {
 		return ""
 	}
-	sum := sha256Sum(cert.Raw)
+	return formatFingerprint(sha256Sum(cert.Raw))
+}
+
+// formatFingerprint renders a digest as colon-separated uppercase hex.
+//
+// It is separate from CertificateFingerprint because FingerprintPin.Display
+// needs the same rendering for a digest that arrived as hex text rather than as
+// a certificate, and an operator comparing two fingerprints character by
+// character must never be shown two different spellings of the same value.
+func formatFingerprint(sum []byte) string {
 	const hexDigits = "0123456789ABCDEF"
+	if len(sum) == 0 {
+		return ""
+	}
 	out := make([]byte, 0, len(sum)*3-1)
 	for i, b := range sum {
 		if i > 0 {
@@ -205,4 +217,60 @@ func CertificateFingerprint(cert *x509.Certificate) string {
 func sha256Sum(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
+}
+
+// LoadCertificateFile parses the first certificate in a PEM or DER file.
+//
+// It returns the parsed certificate rather than only its fingerprint so a caller
+// that wants to print the subject or the expiry alongside the fingerprint — the
+// CLI does — does not have to parse the file a second time.
+//
+// Both encodings are accepted. A relay writes PEM, because that is what
+// tls.LoadX509KeyPair and every certificate tool in the ecosystem expect, but a
+// file exported from a certificate store is often DER, and telling an operator
+// to convert it first is a step they will skip — or worse, get wrong and pin the
+// fingerprint of a file the relay never presents.
+//
+// "First certificate" rather than "leaf" is the honest description: a bundle may
+// hold a chain, and the certificate a relay presents is always the first entry.
+// A caller that wanted a different entry would have no way to say which.
+func LoadCertificateFile(path string) (*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cert: read %s: %w", path, err)
+	}
+	return ParseCertificateBytes(path, data)
+}
+
+// ParseCertificateBytes parses the first certificate in data, which may be PEM
+// or DER.
+func ParseCertificateBytes(name string, data []byte) (*x509.Certificate, error) {
+	der := data
+	if first, _ := pem.Decode(data); first != nil {
+		// A PEM file may open with a banner or hold several blocks, so the
+		// first CERTIFICATE block is searched for rather than the first block
+		// being assumed to be one.
+		der = nil
+		rest := data
+		for {
+			block, remainder := pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			if block.Type == "CERTIFICATE" {
+				der = block.Bytes
+				break
+			}
+			rest = remainder
+		}
+		if der == nil {
+			return nil, fmt.Errorf("cert: %s holds no CERTIFICATE block", name)
+		}
+	}
+
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("cert: parse %s: %w", name, err)
+	}
+	return leaf, nil
 }

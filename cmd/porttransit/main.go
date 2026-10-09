@@ -16,6 +16,7 @@
 //	uninstall        remove everything the installer created
 //	reset-password   set a new management password
 //	show-credentials print the relay's connection details
+//	fingerprint      print a relay certificate's SHA-256 fingerprint
 //	deploy           install a relay on a remote host over SSH
 //	status           print the current configuration's summary
 //	version          print build information
@@ -70,6 +71,8 @@ func main() {
 		err = install.ResetPassword(rest)
 	case "show-credentials":
 		err = install.ShowCredentials(rest)
+	case "fingerprint":
+		err = install.Fingerprint(rest)
 	case "tune":
 		err = install.Tune(rest)
 	case "deploy":
@@ -114,6 +117,7 @@ func usage() {
   uninstall         彻底卸载（删除配置、数据、服务与可执行文件）
   reset-password    重置管理后台管理员密码
   show-credentials  打印中转服务端的连接凭据
+  fingerprint       计算中转服务端证书的 SHA-256 指纹（用于客户端 certFingerprint）
   tune              应用内核网络调优（BBR 等），中转性能的关键
 
 远程部署：
@@ -127,6 +131,8 @@ func usage() {
   porttransit init --mode server --listen 0.0.0.0:8443
   porttransit install --transport tls --port 8443
   porttransit deploy --host 1.2.3.4 --user root --transport tls
+  porttransit fingerprint --cert /etc/porttransit/certs/relay.crt
+  porttransit fingerprint --server relay.example.com:8443
   porttransit reset-password --config /etc/porttransit/config.json
 `)
 }

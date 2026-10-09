@@ -9,11 +9,32 @@
 // # Two client modes
 //
 //   - Standard (default): crypto/tls with a full verification policy. Requires
-//     a certificate the client trusts, or an explicit insecure flag.
+//     a certificate the client trusts, an explicit insecure flag, or a pinned
+//     certificate fingerprint.
 //   - Fingerprint: a uTLS ClientHello that reproduces a real browser's
 //     fingerprint byte for byte. Use this when the relay's certificate is
 //     self-signed (the default for a relay installed by the one-click script)
 //     or when the censor fingerprints TLS stacks rather than certificates.
+//
+// # Trusting a self-signed relay
+//
+// The installer generates a self-signed certificate, which no client can chain
+// to a public root. There are three ways to accept it, in descending order of
+// how much they actually prove:
+//
+//   - certFingerprint: the SHA-256 fingerprint of the relay's leaf certificate.
+//     The client compares it against what the relay presents and refuses the
+//     connection on a mismatch, so a machine in the middle cannot substitute
+//     its own certificate. This is the recommended setting.
+//   - caFile: the relay's own certificate used as a trust anchor. Equivalent in
+//     strength, but it has to be shipped to the client as a file.
+//   - insecure: true: no verification at all. Kept for compatibility, and it is
+//     what the generated client settings still use.
+//
+// certFingerprint takes precedence over insecure: true when both are present.
+// A pin is a far stronger statement than "accept anything", so honouring the
+// weaker setting would leave an operator believing the relay was pinned while
+// nothing was checked.
 //
 // # Wire format
 //
@@ -64,6 +85,10 @@ const (
 	// SettingInsecureSkipVerify accepts any server certificate. Required for
 	// the self-signed certificate the installer generates.
 	SettingInsecureSkipVerify = "insecure"
+	// SettingCertFingerprint pins the SHA-256 fingerprint of the relay's leaf
+	// certificate. It replaces insecure: true for a self-signed relay and takes
+	// precedence over it when both are set.
+	SettingCertFingerprint = "certFingerprint"
 	// SettingFingerprint selects a uTLS ClientHello profile: chrome, firefox,
 	// safari, edge, ios, android, randomized or none (use crypto/tls).
 	SettingFingerprint = "fingerprint"
@@ -103,6 +128,16 @@ func (d Dialer) Dial(ctx context.Context, req transport.DialRequest) (transport.
 		sni = req.Settings.GetString(SettingServerName, host)
 	}
 
+	// The policy is resolved before the socket is opened so a mistyped
+	// fingerprint fails immediately and locally. Dialling first and failing at
+	// handshake time would leave the operator reading a "certificate mismatch"
+	// from a relay that was never the problem.
+	certPolicy, err := transport.ResolveClientCertPolicy(req.Settings, SettingCertFingerprint,
+		req.Settings.GetBool(SettingInsecureSkipVerify, false))
+	if err != nil {
+		return nil, err
+	}
+
 	// Dial the raw socket first so the context governs the connect and the
 	// deadline covers the handshake.
 	raw, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", req.ServerAddr)
@@ -124,9 +159,9 @@ func (d Dialer) Dial(ctx context.Context, req transport.DialRequest) (transport.
 
 	var conn net.Conn
 	if fingerprint == "none" {
-		conn, err = standardHandshake(raw, req, sni)
+		conn, err = standardHandshake(raw, req, sni, certPolicy)
 	} else {
-		conn, err = uTLSHandshake(raw, req, sni, fingerprint)
+		conn, err = uTLSHandshake(raw, req, sni, fingerprint, certPolicy)
 	}
 	if err != nil {
 		raw.Close()
@@ -148,13 +183,18 @@ func (d Dialer) Dial(ctx context.Context, req transport.DialRequest) (transport.
 }
 
 // standardHandshake uses crypto/tls with a conventional verification policy.
-func standardHandshake(raw net.Conn, req transport.DialRequest, sni string) (net.Conn, error) {
+//
+// certPolicy decides what happens after the handshake: normally nothing, but
+// with a pinned fingerprint it is the pin that decides whether the peer is
+// accepted, which is why chain verification is off in that case.
+func standardHandshake(raw net.Conn, req transport.DialRequest, sni string, certPolicy transport.ClientCertPolicy) (net.Conn, error) {
 	cfg := &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: req.Settings.GetBool(SettingInsecureSkipVerify, false),
+		InsecureSkipVerify: certPolicy.InsecureSkipVerify,
 		MinVersion:         minVersion(req.Settings.GetString(SettingMinVersion, "1.2")),
 		NextProtos:         alpnList(req.Settings),
 	}
+	cfg.VerifyConnection = certPolicy.VerifyConnection()
 	if pool := certPoolFrom(req.Settings); pool != nil {
 		cfg.RootCAs = pool
 	}
@@ -168,16 +208,26 @@ func standardHandshake(raw net.Conn, req transport.DialRequest, sni string) (net
 // uTLSHandshake reproduces a real browser's ClientHello. The relay sees the
 // same bytes a browser would send, so a fingerprinting middlebox has nothing
 // to match on.
-func uTLSHandshake(raw net.Conn, req transport.DialRequest, sni, fingerprint string) (net.Conn, error) {
+func uTLSHandshake(raw net.Conn, req transport.DialRequest, sni, fingerprint string, certPolicy transport.ClientCertPolicy) (net.Conn, error) {
 	profile, spec, err := clientHelloProfile(fingerprint)
 	if err != nil {
 		return nil, err
 	}
 	cfg := &utls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: req.Settings.GetBool(SettingInsecureSkipVerify, false),
+		InsecureSkipVerify: certPolicy.InsecureSkipVerify,
 		MinVersion:         minVersion(req.Settings.GetString(SettingMinVersion, "1.2")),
 		NextProtos:         alpnList(req.Settings),
+	}
+	// uTLS mirrors the standard library's VerifyConnection field and calls it
+	// with uTLS's own ConnectionState, so the shared policy cannot supply the
+	// callback itself. The pin check is therefore written out here rather than
+	// adapted, because the alternative — mapping one state type onto the other —
+	// would be a conversion that silently drops fields the day uTLS adds one.
+	if certPolicy.Pin != "" {
+		cfg.VerifyConnection = func(cs utls.ConnectionState) error {
+			return certPolicy.VerifyPeerCertificates(cs.PeerCertificates)
+		}
 	}
 	if pool := certPoolFrom(req.Settings); pool != nil {
 		cfg.RootCAs = pool
@@ -286,6 +336,12 @@ func (h Handler) Handle(ctx context.Context, raw net.Conn, req transport.HandleR
 		raw.Close()
 		return nil, err
 	}
+
+	// Report the fingerprint once so an operator can copy it into a client's
+	// certFingerprint setting instead of reaching for insecure: true. It is
+	// logged here rather than at startup because a fresh install has no
+	// certificate until the first handshake generates one.
+	transport.LogCertificateFingerprint(loggerFor(req.Logger), cert)
 
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},

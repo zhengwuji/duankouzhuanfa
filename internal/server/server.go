@@ -41,13 +41,15 @@ import (
 
 // Server is a running relay.
 type Server struct {
-	cfg    *config.ServerConfig
-	log    *logx.Logger
-	stats  *Stats
-	acl    *ACL
-	guard  *handshakeGuard
-	sem    *semaphore
-	limits config.LimitConfig
+	cfg      *config.ServerConfig
+	log      *logx.Logger
+	stats    *Stats
+	acl      *ACL
+	guard    *handshakeGuard
+	sem      *semaphore
+	limits   config.LimitConfig
+	accounts *accountTable
+	resolver *resolver
 
 	mu        sync.Mutex
 	listeners map[string]*listenerHandle
@@ -59,12 +61,18 @@ type Server struct {
 
 // listenerHandle is one bound inbound endpoint.
 type listenerHandle struct {
-	cfg      config.Listener
-	ln       net.Listener
-	handler  transport.Handler
-	conns    atomic.Int64
-	accepted atomic.Int64
-	rejected atomic.Int64
+	cfg     config.Listener
+	ln      net.Listener
+	handler transport.Handler
+	// identityCapable is resolved once, at bind time, from the transport's
+	// factory. Doing it here rather than per request is both cheaper and more
+	// reliable: the factory is known to be registered because the handler was
+	// just built from it, whereas a per-request lookup depends on the registry
+	// still being populated.
+	identityCapable bool
+	conns           atomic.Int64
+	accepted        atomic.Int64
+	rejected        atomic.Int64
 	// err records why a listener is not serving, so the console can report it
 	// rather than showing a port that silently accepts nothing.
 	err error
@@ -91,6 +99,8 @@ func New(cfg *config.ServerConfig, log *logx.Logger) (*Server, error) {
 		acl:       acl,
 		guard:     newHandshakeGuard(cfg.Limits.MaxHandshakesPerSecondPerIP),
 		limits:    cfg.Limits,
+		accounts:  newAccountTable(cfg),
+		resolver:  newResolver(cfg.Resolver),
 		listeners: map[string]*listenerHandle{},
 	}
 	if cfg.Limits.MaxConnections > 0 {
@@ -127,12 +137,61 @@ func (s *Server) Start(ctx context.Context) error {
 	if started == 0 {
 		s.log.Warn("no listeners were started; the relay is running but accepts nothing")
 	}
+	if n := len(s.accounts.snapshot()); n > 0 {
+		// Announcing this makes the strictness visible: an operator who
+		// configured accounts should know that an unknown client id is now
+		// refused, because that is a behaviour change from having none.
+		s.log.Info("client accounts configured; unknown client ids will be refused", "accounts", n)
+
+		// And it should equally know which listeners the accounts cannot apply
+		// to. Those transports authenticate with a shared secret rather than a
+		// client id, so a per-client policy is impossible on them — saying so
+		// is the difference between a documented limitation and a hole the
+		// operator believes is covered.
+		var unmanaged []string
+		for _, lc := range s.cfg.Listeners {
+			if lc.Enabled && !identityCapable(lc.Transport) {
+				unmanaged = append(unmanaged, lc.Name+"("+lc.Transport+")")
+			}
+		}
+		if len(unmanaged) > 0 {
+			s.log.Warn("these listeners authenticate with a shared secret, so per-client accounts cannot apply to them",
+				"listeners", strings.Join(unmanaged, ", "))
+		}
+	}
+	if d := s.resolver.describe(); d != "system" {
+		s.log.Info("using a custom DNS resolver", "servers", d)
+	}
+	if !socketOptionsSupported {
+		// Saying so once is better than an operator wondering why enabling
+		// tcpFastOpen changed nothing on this platform.
+		for _, lc := range s.cfg.Listeners {
+			if lc.TCPFastOpen || lc.MPTCP {
+				s.log.Warn("tcpFastOpen/mptcp are Linux-only; ignored on this platform",
+					"listener", lc.Name)
+			}
+		}
+	}
 	s.log.Info("relay started", "listeners", started)
 	return nil
 }
 
 // startListener binds one endpoint and spawns its accept loop.
 func (s *Server) startListener(lc config.Listener) error {
+	// Merge the global masking block into this listener before the handler is
+	// built, so a fallback configured once applies everywhere. A listener that
+	// names its own fallback keeps it.
+	lc = applyMasking(lc, s.cfg.Masking)
+	if lc.Settings[settingFallbackAddr] != nil && !maskingAppliesTo(lc.Transport) {
+		// Saying so is better than silently ignoring it: an operator who
+		// configured masking expects probing to be handled, and only these
+		// transports can forward an unauthenticated connection anywhere.
+		s.log.Warn("masking is configured but this transport cannot forward unauthenticated traffic",
+			"listener", lc.Name,
+			"transport", lc.Transport,
+		)
+	}
+
 	handler, err := transport.NewHandler(lc.Transport)
 	if err != nil {
 		return err
@@ -143,12 +202,18 @@ func (s *Server) startListener(lc config.Listener) error {
 		network = "tcp"
 	}
 
-	ln, err := net.Listen(network, lc.Listen)
+	// UDP listeners take the plain path; the socket options are TCP-specific.
+	var ln net.Listener
+	if network == "tcp" {
+		ln, err = listenTCP(s.ctx, lc)
+	} else {
+		ln, err = net.Listen(network, lc.Listen)
+	}
 	if err != nil {
 		return fmt.Errorf("bind %s: %w", lc.Listen, err)
 	}
 
-	h := &listenerHandle{cfg: lc, ln: ln, handler: handler}
+	h := &listenerHandle{cfg: lc, ln: ln, handler: handler, identityCapable: identityCapable(lc.Transport)}
 	s.mu.Lock()
 	s.listeners[lc.Name] = h
 	s.mu.Unlock()
@@ -161,6 +226,9 @@ func (s *Server) startListener(lc config.Listener) error {
 		"transport", lc.Transport,
 		"listen", ln.Addr().String(),
 	)
+	if m := describeMasking(s.cfg.Masking); m != "none" {
+		s.log.Info("masking active", "listener", lc.Name, "masking", m)
+	}
 	return nil
 }
 
@@ -255,6 +323,31 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
+	// An inbound PROXY protocol header must be consumed before anything else
+	// reads from the socket, and only when the listener says to expect one:
+	// reading it unconditionally would eat the first bytes of a normal
+	// connection. The header carries the real client address, which matters
+	// because the per-IP throttle in the accept loop necessarily saw the load
+	// balancer's address instead. It is used to correct the address the log and
+	// the policy see; the throttle cannot be re-run after the fact.
+	if h.cfg.ProxyProtocol {
+		timeout := s.limits.HandshakeTimeout.Or(10 * time.Second)
+		wrapped, realAddr, err := ReadProxyHeader(conn, timeout)
+		if err != nil {
+			s.stats.HandshakeFailures.Add(1)
+			s.log.Debug("proxy protocol header rejected",
+				"listener", h.cfg.Name,
+				"remote", transport.RemoteAddrString(conn),
+				"err", err,
+			)
+			return
+		}
+		conn = wrapped
+		if realAddr != nil {
+			conn = &addressedConn{Conn: conn, remote: realAddr}
+		}
+	}
+
 	handshakeTimeout := s.limits.HandshakeTimeout.Or(10 * time.Second)
 	ctx, cancel := context.WithTimeout(s.ctx, handshakeTimeout)
 	defer cancel()
@@ -299,6 +392,27 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 		return
 	}
 
+	// Admit against the client's account before any work is done. Checking
+	// here rather than at handshake time is deliberate: the client id is
+	// carried in the transport's request frame, which several transports only
+	// produce after their own authentication succeeds, so this is the earliest
+	// point where the identity is trustworthy.
+	acct, err := s.accounts.admit(req.ClientID, h.identityCapable)
+	if err != nil {
+		s.stats.ACLDenied.Add(1)
+		s.log.Info("request refused",
+			"listener", h.cfg.Name,
+			"transport", req.Transport,
+			"client", req.ClientID,
+			"err", err,
+		)
+		// A SOCKS5 client should learn this from the reply code rather than a
+		// bare close, so it can distinguish "denied" from "server is down".
+		writeDialFailure(stream, err)
+		return
+	}
+	defer acct.release()
+
 	target, rule, err := s.resolveTarget(h, stream, req)
 	if err != nil {
 		s.stats.ACLDenied.Add(1)
@@ -314,9 +428,9 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 
 	switch req.Command {
 	case transport.CmdUDPAssociate:
-		s.serveUDP(h, stream, target, rule)
+		s.serveUDP(h, stream, target, rule, acct)
 	default:
-		s.serveTCP(h, stream, target, rule, req)
+		s.serveTCP(h, stream, target, rule, req, acct)
 	}
 }
 
@@ -398,7 +512,7 @@ func (s *Server) matchForward(listenerName string, req *transport.Request) *conf
 }
 
 // serveTCP dials the target and pipes bytes in both directions.
-func (s *Server) serveTCP(h *listenerHandle, stream transport.Stream, target string, rule *config.Forward, req *transport.Request) {
+func (s *Server) serveTCP(h *listenerHandle, stream transport.Stream, target string, rule *config.Forward, req *transport.Request, acct *accountRuntime) {
 	dialTimeout := s.limits.DialTimeout.Or(10 * time.Second)
 	ctx, cancel := context.WithTimeout(s.ctx, dialTimeout)
 	defer cancel()
@@ -443,7 +557,8 @@ func (s *Server) serveTCP(h *listenerHandle, stream transport.Stream, target str
 		"dialMs", time.Since(start).Milliseconds(),
 	)
 
-	copyWithLimits(stream, upstream, s.limits, s.stats, req.ClientID, target)
+	copyWithLimits(stream, upstream, s.limits, s.stats, req.ClientID, target, acct)
+	s.accounts.markDirty()
 }
 
 // dialTarget connects to the chosen upstream.
@@ -457,7 +572,7 @@ func (s *Server) dialTarget(ctx context.Context, target string, rule *config.For
 		// preferred family first and fall back to the other. This matters for
 		// a relay whose IPv6 path is faster but not always available.
 		preferV6 := s.cfg.Resolver.Strategy == "prefer_ipv6"
-		if conn, err := dialPreferred(ctx, nd, target, preferV6); err == nil {
+		if conn, err := dialPreferred(ctx, nd, target, preferV6, s.resolver); err == nil {
 			return conn, nil
 		}
 	}
@@ -465,7 +580,7 @@ func (s *Server) dialTarget(ctx context.Context, target string, rule *config.For
 }
 
 // dialPreferred tries one address family, then the other.
-func dialPreferred(ctx context.Context, nd net.Dialer, target string, preferV6 bool) (net.Conn, error) {
+func dialPreferred(ctx context.Context, nd net.Dialer, target string, preferV6 bool, rv *resolver) (net.Conn, error) {
 	host, port, err := transport.SplitHostPort(target)
 	if err != nil {
 		return nil, err
@@ -475,7 +590,7 @@ func dialPreferred(ctx context.Context, nd net.Dialer, target string, preferV6 b
 		return nd.DialContext(ctx, "tcp", target)
 	}
 
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	addrs, err := rv.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +624,7 @@ func dialPreferred(ctx context.Context, nd net.Dialer, target string, preferV6 b
 }
 
 // serveUDP relays a UDP association.
-func (s *Server) serveUDP(h *listenerHandle, stream transport.Stream, target string, rule *config.Forward) {
+func (s *Server) serveUDP(h *listenerHandle, stream transport.Stream, target string, rule *config.Forward, acct *accountRuntime) {
 	// UDP over the tunnel is framed by the transport as length-prefixed
 	// datagrams; the relay opens a connected UDP socket to the target and
 	// relays each datagram, tracking the reply address so a target that
@@ -525,9 +640,10 @@ func (s *Server) serveUDP(h *listenerHandle, stream transport.Stream, target str
 	s.stats.ActiveForwards.Add(1)
 	defer s.stats.ActiveForwards.Add(-1)
 
-	if err := relayUDP(s.ctx, stream, target, s.limits.UDPTimeout.Or(120*time.Second), s.stats); err != nil {
+	if err := relayUDP(s.ctx, stream, target, s.limits.UDPTimeout.Or(120*time.Second), s.stats, acct); err != nil {
 		s.log.Debug("udp association ended", "target", target, "err", err)
 	}
+	s.accounts.markDirty()
 }
 
 // Stop closes every listener and waits for in-flight relays to finish.
@@ -561,7 +677,27 @@ func (s *Server) Stop() {
 	case <-time.After(10 * time.Second):
 		s.log.Warn("relay shutdown timed out waiting for in-flight connections")
 	}
+
+	// Persist accumulated quota usage on the way out. Without this a restart
+	// would silently reset every client's counter, which turns a quota into
+	// something a client can clear by waiting for a deploy.
+	if err := s.accounts.saveUsage(); err != nil {
+		s.log.Warn("could not persist client quota usage", "err", err)
+	}
 	s.log.Info("relay stopped")
+}
+
+// AccountUsage reports per-client usage for the Web GUI.
+func (s *Server) AccountUsage() []AccountUsage { return s.accounts.snapshot() }
+
+// ResetAccountUsage clears accumulated quota usage for one client, or for all
+// when id is empty. It returns how many accounts were cleared.
+func (s *Server) ResetAccountUsage(id string) int {
+	n := s.accounts.resetUsage(id)
+	if err := s.accounts.saveUsage(); err != nil {
+		s.log.Warn("could not persist client quota reset", "err", err)
+	}
+	return n
 }
 
 // ListenerStatus describes one listener for the Web GUI.

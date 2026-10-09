@@ -387,9 +387,13 @@ function serverForm(existing) {
   const idIn = input('客户端 ID', s.clientId || '', 'text', '服务端按客户端 ID 下发权限，可留空');
   const enabledIn = checkbox('启用该服务器', s.enabled !== false);
   // The transport settings are free-form JSON because each protocol needs
-  // different keys. The hint lists the ones that are easy to get wrong.
+  // different keys. The hint lists the ones that are easy to get wrong, and it
+  // names certFingerprint explicitly: the point of pinning is that an operator
+  // reaches for it instead of insecure, and one who does not know the key
+  // exists cannot reach for it.
   const settingsIn = textarea(
-    '协议参数 (JSON) — tls 可用 fingerprint: chrome/firefox/safari/edge/ios/android/golang/random/random-no-alpn',
+    '协议参数 (JSON) — tls 可用 fingerprint: chrome/firefox/safari/edge/ios/android/golang/random/random-no-alpn；'
+    + '自签证书建议用 certFingerprint（SHA-256 指纹，可用 porttransit fingerprint 获取）代替 insecure',
     JSON.stringify(s.settings || {}, null, 2),
   );
 

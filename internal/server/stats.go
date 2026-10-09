@@ -227,7 +227,10 @@ func (g *handshakeGuard) allow(ip string) bool {
 // Direction naming follows the client's perspective: "up" is client → target,
 // "down" is target → client. That is what an operator expects to see when
 // diagnosing an asymmetric path, which is the whole point of a 中转.
-func copyWithLimits(tunnel, target net.Conn, limits config.LimitConfig, stats *Stats, clientID, targetAddr string) {
+//
+// acct may be nil, which means the relay has no client accounts configured and
+// only the global limits apply.
+func copyWithLimits(tunnel, target net.Conn, limits config.LimitConfig, stats *Stats, clientID, targetAddr string, acct *accountRuntime) {
 	bufSize := limits.BufferSize
 	if bufSize <= 0 {
 		bufSize = 32 * 1024
@@ -238,6 +241,19 @@ func copyWithLimits(tunnel, target net.Conn, limits config.LimitConfig, stats *S
 	if limits.RateLimitKBps > 0 {
 		upLimiter = newRateLimiter(limits.RateLimitKBps)
 		downLimiter = newRateLimiter(limits.RateLimitKBps)
+	}
+
+	// A per-account limit is additional to the global one, not a replacement:
+	// the global limit protects the relay as a whole, while the account limit
+	// is a policy about one client. Applying whichever is tighter is the only
+	// reading that honours both, so each direction uses the stricter limiter.
+	//
+	// The account's limiter object is shared across all of that client's
+	// streams so its token bucket is global to the client; a per-stream bucket
+	// would let the client multiply its rate by opening more streams.
+	if acctLimiter := acct.rateLimiter(); acctLimiter != nil {
+		upLimiter = stricterLimiter(upLimiter, acctLimiter)
+		downLimiter = stricterLimiter(downLimiter, acctLimiter)
 	}
 
 	type result struct {
@@ -266,6 +282,25 @@ func copyWithLimits(tunnel, target net.Conn, limits config.LimitConfig, stats *S
 		} else {
 			stats.BytesDown.Add(r.n)
 		}
+		// Quota accounting counts both directions, because an operator setting
+		// a quota is limiting cost, and cost is traffic in either direction.
+		acct.addBytes(r.n)
+	}
+}
+
+// stricterLimiter picks the lower of two throughput caps.
+//
+// A nil limiter means unlimited, so nil is only returned when both are nil.
+func stricterLimiter(a, b *rateLimiter) *rateLimiter {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case b.rate < a.rate:
+		return b
+	default:
+		return a
 	}
 }
 

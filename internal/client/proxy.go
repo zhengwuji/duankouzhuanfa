@@ -177,10 +177,31 @@ func (c *Client) serveSOCKS5(conn net.Conn) {
 		return
 	}
 	command := reqHead[1]
+	if command == 0x03 {
+		// UDP ASSOCIATE. The address in the request is where the client says
+		// it will send its datagrams from; RFC 1928 allows it to be all zeroes
+		// and browsers almost always send that, so it is consumed and
+		// discarded. The association is pinned to the control connection's peer
+		// instead, which is the only binding that is actually enforceable.
+		if _, err := transport.DecodeAddr(io.MultiReader(newOneShot(reqHead[3]), conn)); err != nil {
+			writeSocksReply(conn, 0x08)
+			return
+		}
+		if !c.cfg.Proxy.UDP {
+			// The operator has not enabled the datagram path. Refusing is the
+			// honest answer: silently accepting and then dropping datagrams
+			// would look like a broken network to the user.
+			c.log.Debug("socks5 udp associate refused: udp is disabled in the local proxy config")
+			writeSocksReply(conn, 0x07)
+			return
+		}
+		c.serveUDPAssociate(conn)
+		return
+	}
 	if command != 0x01 {
-		// Only CONNECT is supported: UDP ASSOCIATE and BIND would need a
-		// separate datagram path, and the client's UDP support is expressed
-		// through a tunnel instead.
+		// BIND (0x02) is not implemented: it needs a second listener and is
+		// obsolete in practice, since every client that wants inbound traffic
+		// today uses a tunnel's fixed local port instead.
 		writeSocksReply(conn, 0x07)
 		return
 	}

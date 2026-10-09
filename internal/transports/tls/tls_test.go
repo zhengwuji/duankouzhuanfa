@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -1697,4 +1698,473 @@ func TestExpiredCertificateIsRefused(t *testing.T) {
 		t.Fatal("the client accepted an expired certificate it otherwise trusted")
 	}
 	server.await(t)
+}
+
+// TestCertFingerprintAcceptsAMatchingPin is the core assertion of the pinning
+// feature: a client that pins the relay's fingerprint must connect to the relay.
+//
+// The relay's certificate is self-signed, so this also proves the pin works
+// where chain verification cannot: no CA is configured and insecure is not set.
+func TestCertFingerprintAcceptsAMatchingPin(t *testing.T) {
+	certPath, keyPath, leaf := generatedCert(t)
+	want := transport.CertificateFingerprint(leaf)
+
+	server := startRelay(t, transport.Settings{
+		SettingPSK:      testPSK,
+		SettingCertFile: certPath,
+		SettingKeyFile:  keyPath,
+	})
+
+	stream, err := server.dial(t, transport.Settings{
+		SettingPSK:             testPSK,
+		SettingCertFingerprint: want,
+	}, "example.com:443")
+	if err != nil {
+		t.Fatalf("Dial with a correct pinned fingerprint: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+
+	if got := stream.Request().Target; got != "example.com:443" {
+		t.Errorf("the client stream reports target %q, want example.com:443", got)
+	}
+
+	res := server.await(t)
+	if res.err != nil {
+		t.Fatalf("the relay refused a pinned client: %v", res.err)
+	}
+	t.Cleanup(func() { res.stream.Close() })
+}
+
+// TestCertFingerprintToleratesTheSpellingsOperatorsPaste proves the accepted
+// input format end to end, not only in the parser.
+//
+// Operators copy fingerprints out of browsers, out of `porttransit fingerprint`
+// and out of other tools, and each writes the separators differently. Rejecting
+// a value over its punctuation would push people towards insecure: true, which
+// is exactly the outcome pinning exists to avoid.
+func TestCertFingerprintToleratesTheSpellingsOperatorsPaste(t *testing.T) {
+	certPath, keyPath, leaf := generatedCert(t)
+	canonical := transport.CertificateFingerprint(leaf)
+
+	spellings := map[string]string{
+		"canonical colon-separated uppercase": canonical,
+		"lowercase":                           strings.ToLower(canonical),
+		"bare hex, no separators":             strings.ReplaceAll(canonical, ":", ""),
+		"dashes instead of colons":            strings.ReplaceAll(canonical, ":", "-"),
+		"spaces instead of colons":            strings.ReplaceAll(canonical, ":", " "),
+		"surrounded by whitespace":            "  " + canonical + "  ",
+	}
+
+	for name, spelling := range spellings {
+		t.Run(name, func(t *testing.T) {
+			server := startRelay(t, transport.Settings{
+				SettingPSK:      testPSK,
+				SettingCertFile: certPath,
+				SettingKeyFile:  keyPath,
+			})
+
+			stream, err := server.dial(t, transport.Settings{
+				SettingPSK:             testPSK,
+				SettingCertFingerprint: spelling,
+			}, "example.com:443")
+			if err != nil {
+				t.Fatalf("Dial with the fingerprint spelled as %q: %v", spelling, err)
+			}
+			t.Cleanup(func() { stream.Close() })
+
+			res := server.await(t)
+			if res.err != nil {
+				t.Fatalf("the relay refused a client pinning %q: %v", spelling, res.err)
+			}
+			res.stream.Close()
+		})
+	}
+}
+
+// TestCertFingerprintRejectsAMismatchedPin is the assertion that makes the
+// feature worth having.
+//
+// A client pinning fingerprint A must refuse a relay presenting fingerprint B.
+// Without this, the setting would be decorative: the whole point is that a
+// machine in the middle cannot substitute its own certificate.
+func TestCertFingerprintRejectsAMismatchedPin(t *testing.T) {
+	serverCert, serverKey, serverLeaf := generatedCert(t)
+
+	// A second, unrelated certificate whose fingerprint is what the client
+	// wrongly pins. It is generated from a real certificate rather than being
+	// made up, so the pin is well-formed and the failure is genuinely about the
+	// mismatch and not about the format.
+	otherDir := t.TempDir()
+	otherPath := filepath.Join(otherDir, "other.crt")
+	otherCert, err := transport.GenerateSelfSigned(transport.SelfSignedOptions{
+		CommonName: "impostor-relay",
+		CertFile:   otherPath,
+		KeyFile:    filepath.Join(otherDir, "other.key"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateSelfSigned: %v", err)
+	}
+	otherLeaf, err := x509.ParseCertificate(otherCert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPin := transport.CertificateFingerprint(otherLeaf)
+
+	server := startRelay(t, transport.Settings{
+		SettingPSK:      testPSK,
+		SettingCertFile: serverCert,
+		SettingKeyFile:  serverKey,
+	})
+
+	stream, err := server.dial(t, transport.Settings{
+		SettingPSK:             testPSK,
+		SettingCertFingerprint: wrongPin,
+	}, "example.com:443")
+	if err == nil {
+		stream.Close()
+		t.Fatal("the client accepted a relay whose certificate fingerprint did not match the pin")
+	}
+	// The failure has to name both fingerprints: the operator needs to see
+	// which certificate the relay actually presented in order to tell a
+	// compromised relay from a stale pin.
+	for _, want := range []string{wrongPin, transport.CertificateFingerprint(serverLeaf)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not name the fingerprint %s", err.Error(), want)
+		}
+	}
+
+	// The relay must not be left holding a stream the client abandoned.
+	if res := server.await(t); res.err == nil {
+		res.stream.Close()
+		t.Error("the relay reported success although the client refused its certificate")
+	}
+}
+
+// TestCertFingerprintRejectsAMalformedPin proves a typo fails loudly.
+//
+// A pin that silently disables verification is the worst possible outcome: the
+// operator believes their relay is pinned while anything at all is accepted. So
+// a malformed value must fail the dial, and it must fail before a socket is
+// opened so the message cannot be mistaken for a network problem.
+func TestCertFingerprintRejectsAMalformedPin(t *testing.T) {
+	// The listener is deliberately never reached: the point is that a bad pin
+	// fails without one. A relay is still started so a client that wrongly
+	// proceeded would be caught rather than erroring out on a refused
+	// connection.
+	server := startRelay(t, transport.Settings{SettingPSK: testPSK})
+
+	bad := map[string]string{
+		"too short":              "aabbcc",
+		"one character short":    strings.Repeat("ab", 31),
+		"a non-hex character":    strings.Repeat("z", 64),
+		"a SHA-1 digest":         strings.Repeat("ab", 20),
+		"hex with an interior g": strings.Repeat("a", 32) + "g" + strings.Repeat("a", 31),
+	}
+
+	for name, pin := range bad {
+		t.Run(name, func(t *testing.T) {
+			stream, err := server.dial(t, transport.Settings{
+				SettingPSK:                testPSK,
+				SettingInsecureSkipVerify: true,
+				SettingCertFingerprint:    pin,
+			}, "example.com:443")
+			if err == nil {
+				stream.Close()
+				t.Fatalf("Dial accepted the malformed fingerprint %q", pin)
+			}
+			if !errors.Is(err, transport.ErrBadFingerprint) {
+				t.Errorf("the error %v does not wrap ErrBadFingerprint", err)
+			}
+			if !strings.Contains(err.Error(), SettingCertFingerprint) {
+				t.Errorf("the error %q does not name the %s setting", err.Error(), SettingCertFingerprint)
+			}
+		})
+	}
+}
+
+// TestCertFingerprintTakesPrecedenceOverInsecure is the precedence rule.
+//
+// A pinned fingerprint is a much stronger statement than "accept anything", and
+// a client that honoured insecure while a pin was configured would leave the
+// operator believing their relay was pinned when nothing was checked. So with
+// both set, the pin decides — and a wrong pin must still be refused.
+func TestCertFingerprintTakesPrecedenceOverInsecure(t *testing.T) {
+	serverCert, serverKey, leaf := generatedCert(t)
+	rightPin := transport.CertificateFingerprint(leaf)
+
+	otherDir := t.TempDir()
+	otherCert, err := transport.GenerateSelfSigned(transport.SelfSignedOptions{
+		CommonName: "impostor-relay",
+		CertFile:   filepath.Join(otherDir, "other.crt"),
+		KeyFile:    filepath.Join(otherDir, "other.key"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateSelfSigned: %v", err)
+	}
+	otherLeaf, err := x509.ParseCertificate(otherCert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPin := transport.CertificateFingerprint(otherLeaf)
+
+	t.Run("a correct pin still connects with insecure set", func(t *testing.T) {
+		server := startRelay(t, transport.Settings{
+			SettingPSK:      testPSK,
+			SettingCertFile: serverCert,
+			SettingKeyFile:  serverKey,
+		})
+
+		stream, err := server.dial(t, transport.Settings{
+			SettingPSK:                testPSK,
+			SettingInsecureSkipVerify: true,
+			SettingCertFingerprint:    rightPin,
+		}, "example.com:443")
+		if err != nil {
+			t.Fatalf("Dial with a correct pin and insecure=true: %v", err)
+		}
+		t.Cleanup(func() { stream.Close() })
+
+		res := server.await(t)
+		if res.err != nil {
+			t.Fatalf("the relay refused the pinned client: %v", res.err)
+		}
+		res.stream.Close()
+	})
+
+	t.Run("a wrong pin is refused even though insecure is set", func(t *testing.T) {
+		// This is the assertion that proves insecure did not win. If it had,
+		// the connection would succeed despite the fingerprint being wrong.
+		server := startRelay(t, transport.Settings{
+			SettingPSK:      testPSK,
+			SettingCertFile: serverCert,
+			SettingKeyFile:  serverKey,
+		})
+
+		stream, err := server.dial(t, transport.Settings{
+			SettingPSK:                testPSK,
+			SettingInsecureSkipVerify: true,
+			SettingCertFingerprint:    wrongPin,
+		}, "example.com:443")
+		if err == nil {
+			stream.Close()
+			t.Fatal("insecure=true overrode the pin: the client accepted a certificate whose fingerprint did not match")
+		}
+		if !strings.Contains(err.Error(), wrongPin) {
+			t.Errorf("the error %q does not name the pinned fingerprint", err.Error())
+		}
+		if res := server.await(t); res.err == nil {
+			res.stream.Close()
+			t.Error("the relay reported success although the client refused its certificate")
+		}
+	})
+}
+
+// TestInsecureStillWorksWithoutAPin is the compatibility assertion.
+//
+// Rule three of the feature is that a configuration with no certFingerprint
+// behaves exactly as it did before the setting existed. The one-click installer
+// writes insecure: true into every generated client, so a regression here would
+// break every fresh install.
+func TestInsecureStillWorksWithoutAPin(t *testing.T) {
+	// No certificate paths at all, so the relay generates a self-signed pair
+	// that the client has no way to verify: this is the fresh-install shape.
+	server := startRelay(t, transport.Settings{SettingPSK: testPSK})
+
+	stream, err := server.dial(t, transport.Settings{
+		SettingPSK:                testPSK,
+		SettingInsecureSkipVerify: true,
+	}, "example.com:443")
+	if err != nil {
+		t.Fatalf("Dial with insecure=true and no pin: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+
+	res := server.await(t)
+	if res.err != nil {
+		t.Fatalf("the relay refused the client: %v", res.err)
+	}
+	res.stream.Close()
+
+	// And with no pin and insecure unset, verification must still be on: a
+	// client that quietly accepted anything would make the whole transport
+	// meaningless.
+	server2 := startRelay(t, transport.Settings{SettingPSK: testPSK})
+	stream2, err := server2.dial(t, transport.Settings{SettingPSK: testPSK}, "example.com:443")
+	if err == nil {
+		stream2.Close()
+		t.Fatal("with no pin and no insecure flag the client accepted a self-signed certificate")
+	}
+	server2.await(t)
+}
+
+// TestCertFingerprintWorksOnTheGoTLSPath proves the pin is enforced on both
+// handshake implementations.
+//
+// tls.go has two: crypto/tls (fingerprint "none") and uTLS (every other
+// profile, and chrome by default). The uTLS path carries its own copy of the
+// callback because uTLS's ConnectionState type is not crypto/tls's, so a pin
+// that only worked on one of them would be a silent hole on the default install
+// path.
+func TestCertFingerprintWorksOnTheGoTLSPath(t *testing.T) {
+	certPath, keyPath, leaf := generatedCert(t)
+	rightPin := transport.CertificateFingerprint(leaf)
+
+	otherDir := t.TempDir()
+	otherCert, err := transport.GenerateSelfSigned(transport.SelfSignedOptions{
+		CommonName: "impostor-relay",
+		CertFile:   filepath.Join(otherDir, "other.crt"),
+		KeyFile:    filepath.Join(otherDir, "other.key"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateSelfSigned: %v", err)
+	}
+	otherLeaf, err := x509.ParseCertificate(otherCert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPin := transport.CertificateFingerprint(otherLeaf)
+
+	for _, profile := range []string{"none", "chrome", "golang"} {
+		t.Run("matching pin/"+profile, func(t *testing.T) {
+			server := startRelay(t, transport.Settings{
+				SettingPSK:      testPSK,
+				SettingCertFile: certPath,
+				SettingKeyFile:  keyPath,
+			})
+
+			stream, err := server.dial(t, transport.Settings{
+				SettingPSK:             testPSK,
+				SettingFingerprint:     profile,
+				SettingCertFingerprint: rightPin,
+			}, "example.com:443")
+			if err != nil {
+				t.Fatalf("Dial with fingerprint %q and a correct pin: %v", profile, err)
+			}
+			t.Cleanup(func() { stream.Close() })
+
+			res := server.await(t)
+			if res.err != nil {
+				t.Fatalf("the relay refused the client: %v", res.err)
+			}
+			res.stream.Close()
+		})
+
+		t.Run("mismatched pin/"+profile, func(t *testing.T) {
+			server := startRelay(t, transport.Settings{
+				SettingPSK:      testPSK,
+				SettingCertFile: certPath,
+				SettingKeyFile:  keyPath,
+			})
+
+			stream, err := server.dial(t, transport.Settings{
+				SettingPSK:             testPSK,
+				SettingFingerprint:     profile,
+				SettingCertFingerprint: wrongPin,
+			}, "example.com:443")
+			if err == nil {
+				stream.Close()
+				t.Fatalf("the %q handshake accepted a certificate that did not match the pin", profile)
+			}
+			server.await(t)
+		})
+	}
+}
+
+// TestRelayLogsItsFingerprint proves the server-side convenience works.
+//
+// The pin is only usable if an operator can obtain the value, and the relay
+// logging its own fingerprint once is what makes that possible without copying
+// a file off the host. It also has to appear on the handshake path rather than at
+// startup, because a fresh install has no certificate until the first handshake
+// generates one.
+func TestRelayLogsItsFingerprint(t *testing.T) {
+	certPath, keyPath, leaf := generatedCert(t)
+	want := transport.CertificateFingerprint(leaf)
+
+	logPath := filepath.Join(t.TempDir(), "relay.log")
+	server := startRelayWithLogFile(t, transport.Settings{
+		SettingPSK:      testPSK,
+		SettingCertFile: certPath,
+		SettingKeyFile:  keyPath,
+	}, logPath)
+	stream, err := server.dial(t, transport.Settings{
+		SettingPSK:                testPSK,
+		SettingInsecureSkipVerify: true,
+	}, "example.com:443")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+
+	res := server.await(t)
+	if res.err != nil {
+		t.Fatalf("the relay refused the handshake: %v", res.err)
+	}
+	res.stream.Close()
+
+	// The relay's own goroutine wrote the line before it reported the result,
+	// so the file is complete by the time it is read here.
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read the relay's log: %v", err)
+	}
+	if !strings.Contains(string(logged), want) {
+		t.Errorf("the relay's log does not carry the fingerprint %s; it logged:\n%s", want, logged)
+	}
+}
+
+// leafOf parses the leaf of a tls.Certificate, for tests that need it inline.
+func leafOf(t *testing.T, cert stdtls.Certificate) *x509.Certificate {
+	t.Helper()
+	if len(cert.Certificate) == 0 {
+		t.Fatal("the certificate carries no DER bytes")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse the certificate: %v", err)
+	}
+	return leaf
+}
+
+// startRelayWithLogFile serves the transport's Handler with a logger writing to
+// path, so a test can assert on what an operator would see.
+//
+// A real logx.Logger writing to a file is used rather than a stub because
+// HandleRequest.Logger is the concrete *logx.Logger type: there is no seam to
+// inject a capturing logger, and a file is the smallest honest substitute.
+func startRelayWithLogFile(t *testing.T, settings transport.Settings, path string) *relay {
+	t.Helper()
+	log, err := logx.New(logx.Options{Level: slog.LevelDebug, File: path})
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	t.Cleanup(func() { log.Close() })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	r := &relay{
+		addr:    ln.Addr().String(),
+		ln:      ln,
+		results: make(chan handleResult, 16),
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				st, err := Handler{}.Handle(context.Background(), conn, transport.HandleRequest{
+					Timeout:  handshakeTimeout,
+					Settings: settings,
+					Logger:   log,
+				})
+				r.results <- handleResult{st, err}
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return r
 }

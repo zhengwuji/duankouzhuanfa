@@ -48,7 +48,9 @@ var ErrDatagramTooLarge = errors.New("server: datagram exceeds the maximum size"
 
 // relayUDP runs one UDP association until either side closes or the
 // association is idle for the configured timeout.
-func relayUDP(ctx context.Context, stream transport.Stream, target string, idle time.Duration, stats *Stats) error {
+//
+// acct may be nil, which means the relay has no client accounts configured.
+func relayUDP(ctx context.Context, stream transport.Stream, target string, idle time.Duration, stats *Stats, acct *accountRuntime) error {
 	if idle <= 0 {
 		idle = 120 * time.Second
 	}
@@ -78,7 +80,7 @@ func relayUDP(ctx context.Context, stream transport.Stream, target string, idle 
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		errCh <- pumpClientToTarget(stream, conn, idle)
+		errCh <- pumpClientToTarget(stream, conn, idle, acct)
 	}()
 
 	// target → client
@@ -86,7 +88,7 @@ func relayUDP(ctx context.Context, stream transport.Stream, target string, idle 
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		errCh <- pumpTargetToClient(conn, stream, idle)
+		errCh <- pumpTargetToClient(conn, stream, idle, acct)
 	}()
 
 	// Watch the context so a shutdown closes the socket and unblocks both
@@ -118,7 +120,7 @@ func relayUDP(ctx context.Context, stream transport.Stream, target string, idle 
 }
 
 // pumpClientToTarget reads framed datagrams from the tunnel and sends them.
-func pumpClientToTarget(stream transport.Stream, conn *net.UDPConn, idle time.Duration) error {
+func pumpClientToTarget(stream transport.Stream, conn *net.UDPConn, idle time.Duration, acct *accountRuntime) error {
 	var lenBuf [2]byte
 	for {
 		if err := stream.SetReadDeadline(time.Now().Add(idle)); err != nil {
@@ -143,12 +145,13 @@ func pumpClientToTarget(stream transport.Stream, conn *net.UDPConn, idle time.Du
 		if _, err := conn.Write(payload); err != nil {
 			return err
 		}
+		acct.addBytes(int64(n))
 	}
 }
 
 // pumpTargetToClient reads datagrams from the target and frames them onto the
 // tunnel.
-func pumpTargetToClient(conn *net.UDPConn, stream transport.Stream, idle time.Duration) error {
+func pumpTargetToClient(conn *net.UDPConn, stream transport.Stream, idle time.Duration, acct *accountRuntime) error {
 	buf := make([]byte, maxDatagram)
 	var frame []byte
 	for {
@@ -175,6 +178,7 @@ func pumpTargetToClient(conn *net.UDPConn, stream transport.Stream, idle time.Du
 		if _, err := stream.Write(frame); err != nil {
 			return err
 		}
+		acct.addBytes(int64(n))
 	}
 }
 

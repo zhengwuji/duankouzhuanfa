@@ -229,6 +229,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/health", s.auth(s.handleHealth))
 	mux.HandleFunc("/api/v1/probe", s.auth(s.handleProbe))
 	mux.HandleFunc("/api/v1/password", s.auth(s.handlePassword))
+	mux.HandleFunc("/api/v1/accounts", s.auth(s.handleAccounts))
+	// Registered before the "/accounts" pattern would match it, because a
+	// trailing-slash pattern is more specific and wins in ServeMux.
+	mux.HandleFunc("/api/v1/accounts/reset", s.auth(s.handleAccountsReset))
 
 	// Remote relay deployment over SSH — the "install the relay on my server"
 	// button. It is authenticated and audited like any other mutation.
