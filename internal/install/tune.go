@@ -102,7 +102,10 @@ type TuneResult struct {
 // Summary renders a one-line description for the console and the installer.
 func (r TuneResult) Summary() string {
 	if !r.Writable {
-		return "内核参数不可写（容器环境？），已跳过调优"
+		// Nothing took effect. Saying "applied" here would be a lie the
+		// operator cannot see through, because the relay keeps working either
+		// way and the difference only shows up as unexplained slowness.
+		return "内核参数不可写（容器环境？），未能调优"
 	}
 	parts := []string{fmt.Sprintf("拥塞控制 %s", r.CongestionControl), fmt.Sprintf("队列规则 %s", r.QueueDiscipline)}
 	if !r.BBRSupported {
@@ -294,7 +297,13 @@ func Tune(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("✔ %s\n", res.Summary())
+	// The marker has to match what actually happened: a tick next to "未能调优"
+	// reads as success and is exactly the kind of detail an operator skims past.
+	if res.Writable {
+		fmt.Printf("✔ %s\n", res.Summary())
+	} else {
+		fmt.Printf("! %s\n", res.Summary())
+	}
 	if res.Path != "" {
 		fmt.Printf("  已写入 %s\n", res.Path)
 	}

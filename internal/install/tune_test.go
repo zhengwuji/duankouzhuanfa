@@ -113,7 +113,7 @@ func TestTuneResultSummaryReportsWhatHappened(t *testing.T) {
 	// A container is the common "did nothing" case and must say so plainly
 	// rather than claiming success.
 	container := TuneResult{Writable: false}
-	if !strings.Contains(container.Summary(), "跳过") {
+	if !strings.Contains(container.Summary(), "未能调优") {
 		t.Errorf("summary %q does not explain that nothing was applied", container.Summary())
 	}
 
@@ -179,7 +179,7 @@ func TestTuneKernelDegradesGracefully(t *testing.T) {
 		if res.Applied != 0 {
 			t.Errorf("applied %d settings in a read-only environment", res.Applied)
 		}
-		if !strings.Contains(res.Summary(), "跳过") {
+		if !strings.Contains(res.Summary(), "未能调优") {
 			t.Errorf("summary %q hides that nothing was applied", res.Summary())
 		}
 		return
@@ -298,7 +298,7 @@ func TestTuneKernelReportsNothingWritable(t *testing.T) {
 	if res.Applied != 0 {
 		t.Errorf("applied %d settings in an empty tree", res.Applied)
 	}
-	if !strings.Contains(res.Summary(), "跳过") {
+	if !strings.Contains(res.Summary(), "未能调优") {
 		t.Errorf("summary %q does not say that nothing was applied", res.Summary())
 	}
 	if res.Path != "" {
@@ -430,5 +430,46 @@ func TestSysctlValueEqualToleratesWhitespaceOnly(t *testing.T) {
 	// would look like success.
 	if sysctlValueEqual("128", "32768") {
 		t.Error("different values compared equal")
+	}
+}
+
+// Tune's console output must not put a success marker next to a report of
+// failure. An operator skims the tick marks, so a tick beside "未能调优" reads
+// as "this worked" — which is the one thing a tuning step must not imply when
+// nothing was applied.
+func TestTuneCommandOutputMarkersMatchReality(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux only")
+	}
+	// An empty tree: nothing can be applied, so the honest output is a warning.
+	withSysctlRoot(t, t.TempDir())
+
+	out, err := captureStdout(t, func() error { return Tune(nil) })
+	if err != nil {
+		t.Fatalf("Tune returned an error instead of degrading: %v", err)
+	}
+
+	if strings.Contains(out, "✔") {
+		t.Errorf("a success marker was printed although nothing was applied:\n%s", out)
+	}
+	if !strings.Contains(out, "未能调优") {
+		t.Errorf("the output does not say nothing was applied:\n%s", out)
+	}
+}
+
+// And the converse: when settings really are applied, the output must say so.
+func TestTuneCommandReportsSuccessWhenItApplies(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux only")
+	}
+	root := fakeSysctlRoot(t, "net.core.somaxconn")
+	withSysctlRoot(t, root)
+
+	out, err := captureStdout(t, func() error { return Tune([]string{"--no-persist"}) })
+	if err != nil {
+		t.Fatalf("Tune: %v", err)
+	}
+	if !strings.Contains(out, "✔") {
+		t.Errorf("a setting was applied but the output shows no success marker:\n%s", out)
 	}
 }

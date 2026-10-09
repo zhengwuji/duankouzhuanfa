@@ -105,95 +105,25 @@ install_deps() {
 tune_kernel() {
   # 中转的两段线路都是跨国链路，必然有丢包。默认的 CUBIC 一遇到丢包就把
   # 拥塞窗口砍半，BBR 不这么做，所以在有丢包的链路上差距很明显。这是所有
-  # 优化里投入产出比最高的一项，而且不需要改任何代码。
+  # 优化里投入产出比最高的一项。
   #
-  # 全部写入独立文件，卸载时一起删掉，不会污染系统原有配置。
+  # 实际参数与逐项读回校验都在二进制里的 `porttransit tune` 实现。这里刻意
+  # 不重复一遍：两份清单一定会漂移，而漂移的表现是「脚本说调好了、程序说
+  # 没调」这种最难排查的状态。
   [[ "${SKIP_TUNE}" -eq 1 ]] && { info "按要求跳过内核调优"; return; }
 
   info "内核网络调优"
-
-  # 容器（OpenVZ / LXC）里这些参数通常是只读的，先探测再动手，
-  # 否则后面每一步都会失败并刷一屏错误。
-  if [[ ! -w /proc/sys/net/ipv4/tcp_congestion_control ]] 2>/dev/null; then
-    warn "内核参数不可写（容器环境？），跳过调优；中转仍可正常使用"
-    return
+  if ! "${BIN_PATH}" tune; then
+    # 调优失败不影响中转本身，只是慢一些。
+    warn "内核调优未完成；中转仍可正常使用（可稍后手动执行：${BIN_PATH} tune）"
+  elif [[ -f "${SYSCTL_PATH}" ]]; then
+    # 文件存在才说明真的有参数生效了。不能只看退出码：容器里所有参数都写不
+    # 进去，命令仍然成功返回（这是刻意的，否则容器里会安装失败），此时打出
+    # 「调优完成」就是在撒谎。
+    ok "内核调优完成，已写入 ${SYSCTL_PATH}"
+  else
+    warn "内核参数不可写（容器环境？），本次未调优；中转仍可正常使用"
   fi
-
-  local available=""
-  available="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
-
-  # BBR 需要内核 4.9+ 且模块可用。先尝试加载，再看是否真的可用。
-  if [[ "${available}" != *bbr* ]]; then
-    modprobe tcp_bbr 2>/dev/null || true
-    available="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
-  fi
-
-  if [[ "${available}" != *bbr* ]]; then
-    warn "内核不支持 BBR（当前可用：${available:-未知}），仅调整缓冲区与连接数上限"
-  fi
-
-  cat > "${SYSCTL_PATH}" <<EOF
-# PortTransit 中转性能调优
-# 由 install.sh 生成；删除本文件并执行 sysctl --system 即可恢复系统默认值。
-
-# BBR 需要 fq 作为队列规则才能发挥效果。
-net.core.default_qdisc = fq
-
-# 跨国链路带宽延迟积很大，默认缓冲区（通常 208KB）会限制单条连接吞吐。
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-
-# 中转会同时持有大量长短连接。
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_syn_backlog = 8192
-
-# 中转会发出大量短命的上行连接（每条客户端连接对应一条到目标的连接），
-# 默认端口范围只有约 28k 个，高峰期会成为瓶颈。
-net.ipv4.ip_local_port_range = 10240 65535
-
-# 复用 TIME_WAIT 状态的出站连接。只影响主动发起方，是安全的。
-net.ipv4.tcp_tw_reuse = 1
-
-# 长连接空闲后再突发时不要重置拥塞窗口——中转的典型流量形态。
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# 路径上若有设备丢弃 ICMP，PMTU 探测能自动降低 MSS 而不是黑洞。
-net.ipv4.tcp_mtu_probing = 1
-
-# 客户端与服务端都受益：允许 SYN 携带数据，省一个 RTT。
-net.ipv4.tcp_fastopen = 3
-
-# 更积极地回收长时间空闲的已建立连接，避免中转机上堆积无用状态。
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-EOF
-
-  if [[ "${available}" == *bbr* ]]; then
-    echo "net.ipv4.tcp_congestion_control = bbr" >> "${SYSCTL_PATH}"
-  fi
-
-  # 逐项应用：某一条不被内核接受（例如模块缺失）不应该让整份配置失效。
-  local failed=0
-  while IFS= read -r line; do
-    [[ -z "${line}" || "${line}" == \#* ]] && continue
-    sysctl -qw "${line}" 2>/dev/null || failed=$((failed + 1))
-  done < "${SYSCTL_PATH}"
-
-  if [[ "${failed}" -gt 0 ]]; then
-    warn "${failed} 项内核参数未能应用（容器或旧内核常见），其余已生效"
-  fi
-
-  # 写入 sysctl.d 让设置在重启后仍然生效。
-  sysctl -p "${SYSCTL_PATH}" >/dev/null 2>&1 || true
-
-  local cc
-  cc="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo 未知)"
-  local qdisc
-  qdisc="$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo 未知)"
-  ok "拥塞控制：${cc}  队列规则：${qdisc}"
 }
 
 download_binary() {
@@ -463,7 +393,11 @@ do_uninstall() {
   # 删掉调优文件，否则重装或重启后这些参数会一直被应用，而用户以为已经卸载干净。
   # 当前正在生效的值只能等重启才会回到内核默认——sysctl 无法"撤销"到未知的旧值，
   # 硬改回某个猜测值反而可能破坏系统或运维自己的设置。这一点如实告知。
-  if [[ -f "${SYSCTL_PATH}" ]]; then
+  #
+  # 优先用二进制自己的子命令，保持与安装时的实现同源。
+  if [[ -x "${BIN_PATH}" ]] && "${BIN_PATH}" tune --revert >/dev/null 2>&1; then
+    ok "已删除内核调优配置 ${SYSCTL_PATH}"
+  elif [[ -f "${SYSCTL_PATH}" ]]; then
     rm -f "${SYSCTL_PATH}"
     ok "已删除内核调优配置 ${SYSCTL_PATH}"
     warn "当前运行中的内核参数仍是调优值，重启后恢复系统默认"
