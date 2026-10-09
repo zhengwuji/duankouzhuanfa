@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PortTransit 控制台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo">⇄</span>
+      <div>
+        <strong>PortTransit</strong>
+        <small id="brand-version">—</small>
+      </div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item" data-view="dashboard">总览</button>
+      <button class="nav-item" data-view="servers">中转服务器</button>
+      <button class="nav-item" data-view="tunnels">端口转发</button>
+      <button class="nav-item" data-view="health">线路健康</button>
+      <button class="nav-item" data-view="deploy">远程部署</button>
+      <button class="nav-item" data-view="logs">日志</button>
+      <button class="nav-item" data-view="settings">设置</button>
+    </nav>
+    <div class="sidebar-footer">
+      <span id="mode-badge" class="badge">—</span>
+      <button id="logout" class="link">退出登录</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <header class="topbar">
+      <h1 id="view-title">总览</h1>
+      <div class="topbar-actions">
+        <button id="refresh" class="btn ghost">刷新</button>
+      </div>
+    </header>
+    <div id="view" class="view"></div>
+  </main>
+</div>
+
+<section id="login" class="login-wrap">
+  <form id="login-form" class="card login-card">
+    <h1><span class="logo">⇄</span> PortTransit</h1>
+    <p class="muted">请输入管理员账号以进入控制台</p>
+    <label>用户名<input id="login-user" name="username" autocomplete="username" value="admin" required></label>
+    <label>密码<input id="login-pass" name="password" type="password" autocomplete="current-password" required></label>
+    <p id="login-error" class="error" hidden></p>
+    <button class="btn primary" type="submit">登录</button>
+  </form>
+</section>
+
+<div id="toasts" class="toasts"></div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-body card">
+    <h2 id="modal-title">标题</h2>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Shell scripts and the Makefile must stay LF in the repository. Git's
+# autocrlf would otherwise hand a CRLF shebang to a Linux host, and
+# `#!/usr/bin/env bash\r` fails with "bad interpreter" — a confusing failure
+# for something that looks like a line-ending detail.
+*.sh        text eol=lf
+Makefile    text eol=lf
+
+# Go source is LF everywhere.
+*.go        text eol=lf
+*.mod       text eol=lf
+*.sum       text eol=lf
+
+# PowerShell is the one thing that is happier with CRLF on Windows.
+*.ps1       text eol=crlf
+
+# Markdown and web assets: normalise on commit, leave the checkout alone.
+*.md        text
+*.js        text
+*.css       text
+*.html      text
+
+# Binaries are never touched.
+*.tar.gz    binary
+*.exe       binary
