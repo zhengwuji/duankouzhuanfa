@@ -47,6 +47,11 @@ type Client struct {
 	stats *Stats
 	pools *poolSet
 
+	// mux holds the multiplexed sessions, one per relay. It is always present
+	// so openStream never has to test it, and it is inert on a configuration
+	// where no relay has multiplexing switched on.
+	mux *sessionPool
+
 	mu      sync.Mutex
 	tunnels map[string]*tunnelHandle
 	proxy   *proxyHandle
@@ -118,6 +123,7 @@ func New(cfg *config.ClientConfig, log *logx.Logger) (*Client, error) {
 		pools:   newPoolSet(cfg.Servers),
 		tunnels: map[string]*tunnelHandle{},
 	}
+	c.mux = newSessionPool(c)
 	return c, nil
 }
 
@@ -172,8 +178,39 @@ func (c *Client) Start(ctx context.Context) error {
 		}()
 	}
 
+	// The reaper only runs when something could go idle. Starting it on a
+	// configuration with no multiplexing would be a goroutine and a ticker
+	// doing nothing for the life of the process.
+	if c.mux.anyEnabled() {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.mux.reapLoop(c.ctx)
+		}()
+	}
+	c.warnUnusableMux()
+
 	c.log.Info("client started", "tunnels", started, "servers", len(c.cfg.Servers))
 	return nil
+}
+
+// warnUnusableMux reports a relay whose settings ask for multiplexing on a
+// transport that cannot carry it.
+//
+// It is a warning rather than an error on purpose: the client still works, it
+// simply opens a dedicated connection per stream on that relay, which is what
+// it did before multiplexing existed. Refusing to start would take a working
+// configuration out of service over a setting that can only cost performance.
+func (c *Client) warnUnusableMux() {
+	for _, e := range c.pools.Entries() {
+		if !e.Enabled || !transport.MuxEnabled(e.Settings) || e.muxOK {
+			continue
+		}
+		c.log.Warn("multiplexing is set on this relay but its transport cannot carry a multiplexed session; connections will use one relay connection each",
+			"server", e.Name,
+			"transport", e.Transport,
+		)
+	}
 }
 
 // startTunnel binds one local forwarding listener.
@@ -338,6 +375,17 @@ func (c *Client) serveTunnel(h *tunnelHandle, local net.Conn) {
 // must not surface as an application error when a healthy one is available.
 // The retry budget is bounded so a client with every relay down fails in a
 // predictable time rather than hanging.
+//
+// # Multiplexing
+//
+// When the chosen relay has multiplexing switched on, the request is served as
+// a stream inside that relay's pooled multiplexed session instead of a fresh
+// connection. The relay list, the order and the retry budget are identical
+// either way: multiplexing changes how a stream is carried, not which relay
+// carries it. A relay that is configured for multiplexing but does not actually
+// serve one — an older relay, or one whose listener has multiplexing off — is retried
+// once as a plain connection, because the relay is working and refusing it over
+// a settings mismatch would take a healthy path out of service.
 func (c *Client) openStream(serverID, group, balance string, req *transport.Request) (transport.Stream, *serverEntry, error) {
 	candidates, err := c.pools.candidates(serverID, group, balance)
 	if err != nil {
@@ -358,8 +406,8 @@ func (c *Client) openStream(serverID, group, balance string, req *transport.Requ
 	for i := 0; i < attempts; i++ {
 		entry := candidates[i]
 
-		ctx, cancel := context.WithTimeout(c.ctx, c.dialTimeout())
-		stream, err := c.dialRelay(ctx, entry, req)
+		ctx, cancel := context.WithTimeout(ctx0(c.ctx), c.dialTimeout())
+		stream, err := c.openVia(ctx, entry, req)
 		cancel()
 		if err == nil {
 			entry.markSuccess()
@@ -377,6 +425,61 @@ func (c *Client) openStream(serverID, group, balance string, req *transport.Requ
 		)
 	}
 	return nil, nil, fmt.Errorf("client: every candidate relay failed, last error: %w", lastErr)
+}
+
+// openVia opens one stream against one relay, multiplexed when that relay is
+// configured for it. The context must already carry the dial budget.
+//
+// The decision is taken here, per attempt, rather than once for the whole
+// openStream call, because the candidates are not interchangeable: a group may
+// mix a relay with multiplexing and one without, and each has to be used the
+// way it was configured.
+func (c *Client) openVia(ctx context.Context, entry *serverEntry, req *transport.Request) (transport.Stream, error) {
+	if !entry.muxOK {
+		return c.dialRelay(ctx, entry, req)
+	}
+
+	slot, err := c.mux.relay(entry)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := slot.open(ctx, req)
+	if err == nil {
+		return stream, nil
+	}
+
+	// A relay that refuses multiplexing, or whose sessions are all full, is
+	// still a working relay. Falling back to a dedicated connection on the same
+	// relay keeps a half-upgraded deployment usable — the operator can enable
+	// multiplexing on the client first and on the relay later — where treating the
+	// refusal as a dial failure would drop every relay in the group the moment
+	// one of them disagreed.
+	//
+	// The full-session case matters for a different reason: a local program
+	// opening more connections than the session cap allows must keep working,
+	// merely without the multiplexing saving, rather than start failing.
+	if errors.Is(err, errMuxRefused) || errors.Is(err, errMuxFull) {
+		c.log.Debug("using a dedicated connection instead of a multiplexed session",
+			"server", entry.Name,
+			"transport", entry.Transport,
+			"err", err,
+		)
+		return c.dialRelay(ctx, entry, req)
+	}
+	return nil, err
+}
+
+// ctx0 returns ctx, or a background context when ctx is nil.
+//
+// A client that has not been Start'ed has no context, and a request made
+// against one — a probe, a test — must still work rather than panic on a nil
+// context. Background means "no deadline", which the dial's own timeout then
+// supplies.
+func ctx0(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // dialRelay performs one transport handshake against one relay.
@@ -566,6 +669,13 @@ func (c *Client) Stop() {
 		c.cancel()
 	}
 
+	// Close the multiplexed sessions before waiting for in-flight relays. A
+	// session is a connection the relay holds open on the client's behalf, so
+	// leaving it to the deferred close would keep the relay's buffers and file
+	// descriptors allocated for as long as the client process lives — and would
+	// make every restart leave a session behind.
+	c.mux.closeAll()
+
 	c.mu.Lock()
 	handles := make([]*tunnelHandle, 0, len(c.tunnels))
 	for _, h := range c.tunnels {
@@ -615,6 +725,20 @@ type serverEntry struct {
 	failThreshold    int
 	successThreshold int
 
+	// muxOK records whether this relay should be reached through a multiplexed
+	// session, and muxIdle how long such a session is kept with no streams on
+	// it. Both are resolved once, when the entry is built, from the transport's
+	// own capability plus the operator's setting.
+	//
+	// Resolving capability here rather than per request is deliberate: the
+	// answer cannot change while the process runs, and a per-request registry
+	// lookup would put a map read on the hot path of every proxied connection.
+	// It is also what keeps a native-header transport out of the session path
+	// entirely — such a scheme has no connection-level command to request a
+	// session with, so a request sent that way would arrive with no target.
+	muxOK   bool
+	muxIdle time.Duration
+
 	mu           sync.Mutex
 	healthy      bool
 	consecFail   int
@@ -626,12 +750,15 @@ type serverEntry struct {
 }
 
 func newServerEntry(cfg config.ServerEntry) *serverEntry {
-	return &serverEntry{
+	e := &serverEntry{
 		ServerEntry: cfg,
 		// A relay starts optimistic: blocking traffic until the first health
 		// check completes would add a full check interval to startup.
 		healthy: true,
 	}
+	e.muxOK = transport.MuxEnabled(cfg.Settings) && transport.SupportsMux(cfg.Transport)
+	e.muxIdle = transport.MuxIdleTimeout(cfg.Settings, transport.ClientMuxIdleTimeout)
+	return e
 }
 
 // settings returns the transport settings for this relay, with the standard

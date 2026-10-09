@@ -393,7 +393,8 @@ function serverForm(existing) {
   // exists cannot reach for it.
   const settingsIn = textarea(
     '协议参数 (JSON) — tls 可用 fingerprint: chrome/firefox/safari/edge/ios/android/golang/random/random-no-alpn；'
-    + '自签证书建议用 certFingerprint（SHA-256 指纹，可用 porttransit fingerprint 获取）代替 insecure',
+    + '自签证书建议用 certFingerprint（SHA-256 指纹，可用 porttransit fingerprint 获取）代替 insecure；'
+    + 'mux: true 可开启多路复用（服务端 listener 也要开，且仅 direct/tls/ws/httpupgrade/reality 支持）',
     JSON.stringify(s.settings || {}, null, 2),
   );
 

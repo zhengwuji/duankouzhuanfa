@@ -374,8 +374,9 @@ func (h Handler) Handle(ctx context.Context, raw net.Conn, req transport.HandleR
 		reqCommand = transport.CmdUDPAssociate
 	case cmdMux:
 		// MUX is a client-side multiplexing request that this relay does not
-		// implement; the client's own smux layer already handles multiplexing
-		// above the transport, so a MUX command here would be a client bug.
+		// implement; the client's own multiplexing layer already handles
+		// multiplexing above the transport, so a MUX command here would be a
+		// client bug.
 		conn.Close()
 		return nil, fmt.Errorf("%w: vless MUX command is not supported", transport.ErrProtocol)
 	}

@@ -25,14 +25,14 @@ const ProtocolVersion = version.ProtocolVersion
 //	offset  size  field
 //	0       4     magic "PTRF" (PortTransit Relay Frame)
 //	4       1     protocol version
-//	5       1     command (CmdConnectTCP / CmdUDPAssociate / CmdPing)
+//	5       1     command (CmdConnectTCP / CmdUDPAssociate / CmdPing / CmdMux)
 //	6       1     flags (reserved, must be 0)
 //	7       1     reserved (must be 0)
 //	8       8     unix timestamp, seconds, big endian
 //	16      8     nonce, random
 //	24      1     client-id length
 //	25      n     client-id bytes
-//	25+n    m     SOCKS5-encoded target address (absent for CmdPing)
+//	25+n    m     SOCKS5-encoded target address (absent for CmdPing and CmdMux)
 //	…       1     padding length
 //	…       p     padding bytes (random)
 //	…       32    HMAC-SHA256 of every preceding byte, keyed by the PSK
@@ -116,7 +116,7 @@ func EncodePreamble(p *Preamble, psk []byte) ([]byte, error) {
 	buf = append(buf, byte(len(p.ClientID)))
 	buf = append(buf, p.ClientID...)
 
-	if p.Command != CmdPing {
+	if p.Command.carriesTarget() {
 		var err error
 		buf, err = EncodeAddr(buf, p.Target)
 		if err != nil {
@@ -202,7 +202,7 @@ func DecodePreamble(r io.Reader) (*Preamble, error) {
 		body = append(body, id...)
 	}
 
-	if p.Command != CmdPing {
+	if p.Command.carriesTarget() {
 		addr, n, err := readAddrStream(r)
 		if err != nil {
 			return nil, err

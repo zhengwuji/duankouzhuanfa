@@ -44,6 +44,17 @@ const (
 	// CmdPing is a liveness probe: the relay answers and closes without
 	// dialing anything. Used by health checks and the Web GUI latency test.
 	CmdPing Command = 0x03
+	// CmdMux asks the relay to treat the connection as a multiplexed
+	// session rather than as one stream. It is a connection-level
+	// command: it is sent once on the TCP connection, before the session
+	// starts, and it carries no target address.
+	//
+	// The value 0x04 was chosen rather than reusing 0x03 because VLESS's own
+	// MUX command already occupies 0x03 in that wire protocol, and the VLESS
+	// handler maps its command byte onto this enumeration. Sharing the number
+	// would turn a request for multiplexing into a ping — which the relay
+	// answers and closes, so the client would see a session that dies at once.
+	CmdMux Command = 0x04
 )
 
 // String renders the command for logs and API payloads.
@@ -55,6 +66,8 @@ func (c Command) String() string {
 		return "udp"
 	case CmdPing:
 		return "ping"
+	case CmdMux:
+		return "mux"
 	default:
 		return fmt.Sprintf("unknown(0x%02x)", uint8(c))
 	}
@@ -63,10 +76,17 @@ func (c Command) String() string {
 // Valid reports whether the command byte is one this build understands.
 func (c Command) Valid() bool {
 	switch c {
-	case CmdConnectTCP, CmdUDPAssociate, CmdPing:
+	case CmdConnectTCP, CmdUDPAssociate, CmdPing, CmdMux:
 		return true
 	}
 	return false
+}
+
+// carriesTarget reports whether a command is followed by a target address in
+// the preamble. CmdPing and CmdMux are connection-level commands with nothing
+// to dial, so the address field is absent for both.
+func (c Command) carriesTarget() bool {
+	return c != CmdPing && c != CmdMux
 }
 
 // Request is the decoded intent behind one stream.

@@ -73,6 +73,17 @@ type listenerHandle struct {
 	conns           atomic.Int64
 	accepted        atomic.Int64
 	rejected        atomic.Int64
+	// muxReplay guards the nonces of the per-stream preambles carried by this
+	// listener's multiplexed sessions. It is built once and shared by every
+	// stream of every session on this listener.
+	//
+	// Sharing is what makes it useful. A transport builds its own guard per
+	// connection, which is correct when a connection carries exactly one
+	// request; a session carries hundreds, so a guard built per stream would
+	// start empty each time and accept a nonce it had already seen on a sibling
+	// stream — exactly the replay the guard exists to stop. It is nil when
+	// multiplexing is off or replay protection is disabled.
+	muxReplay *transport.ReplayGuard
 	// err records why a listener is not serving, so the console can report it
 	// rather than showing a port that silently accepts nothing.
 	err error
@@ -214,6 +225,9 @@ func (s *Server) startListener(lc config.Listener) error {
 	}
 
 	h := &listenerHandle{cfg: lc, ln: ln, handler: handler, identityCapable: identityCapable(lc.Transport)}
+	if transport.MuxEnabled(lc.Settings) {
+		h.muxReplay = transport.NewStreamReplayGuard(lc.Settings)
+	}
 	s.mu.Lock()
 	s.listeners[lc.Name] = h
 	s.mu.Unlock()
@@ -228,6 +242,25 @@ func (s *Server) startListener(lc config.Listener) error {
 	)
 	if m := describeMasking(s.cfg.Masking); m != "none" {
 		s.log.Info("masking active", "listener", lc.Name, "masking", m)
+	}
+	if transport.MuxEnabled(lc.Settings) {
+		if !transport.SupportsMux(lc.Transport) {
+			// Saying so at bind time is the difference between "multiplexing is
+			// on" and "multiplexing is on but cannot work here". A scheme that
+			// carries the target inside its own wire protocol has no
+			// connection-level command to accept, so a client configured for
+			// mux will fall back to dedicated connections on every request —
+			// silently, unless this is said once.
+			s.log.Warn("multiplexing is enabled but this transport cannot carry a multiplexed session; clients will fall back to one connection per stream",
+				"listener", lc.Name,
+				"transport", lc.Transport,
+			)
+		} else {
+			s.log.Info("multiplexing enabled",
+				"listener", lc.Name,
+				"maxStreams", transport.MuxMaxStreams(lc.Settings),
+			)
+		}
 	}
 	return nil
 }
@@ -385,6 +418,27 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 		return
 	}
 
+	// A connection-level request to multiplex. The transport has already
+	// decoded and authenticated the preamble, so this decision is made on a
+	// verified frame — a client cannot reach the session path without the
+	// listener's credentials.
+	if req.Command == transport.CmdMux {
+		s.serveMuxSession(h, conn, stream, req)
+		return
+	}
+
+	s.serveRequest(h, stream, req)
+}
+
+// serveRequest handles one already-decoded request: admission, policy, and the
+// forwarding itself.
+//
+// It is separated from serve so that a stream inside a multiplexed session
+// takes exactly the same path as a whole connection. Anything checked here —
+// the account's concurrency slot, the forward rules, the ACL — therefore
+// applies to a multiplexed stream identically, and a policy cannot be bypassed
+// by multiplexing.
+func (s *Server) serveRequest(h *listenerHandle, stream transport.Stream, req *transport.Request) {
 	// A ping that a transport expressed as a TCP connect to the relay itself
 	// must not be dialed: that would loop back into this listener.
 	if req.Meta != nil && req.Meta["ping"] == "true" {

@@ -891,9 +891,10 @@ func TestHandlerParsesUDPHandshake(t *testing.T) {
 // and that the refusal is distinguishable from a generic failure.
 //
 // The transport deliberately does not implement VLESS MUX: the client already
-// runs its own smux layer above the transport, so a MUX command here would be a
-// client bug. Accepting it would silently produce a stream whose framing the
-// relay does not understand, which is far worse than a clean refusal.
+// runs its own multiplexing layer above the transport, so a MUX command here
+// would be a client bug. Accepting it would silently produce a stream whose
+// framing the relay does not understand, which is far worse than a clean
+// refusal.
 func TestHandlerRefusesTheMuxCommand(t *testing.T) {
 	client, server := pair(t)
 	done := runHandle(server, transport.HandleRequest{
