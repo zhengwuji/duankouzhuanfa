@@ -1,0 +1,59 @@
+name: ci
+
+# The pre-commit hook (see .githooks/pre-commit) only protects a clone where
+# someone ran `make hooks`. A public repository cannot rely on that, so the same
+# checks run here on every push and pull request: a credential that reaches a
+# commit must be treated as leaked and rotated, and the cheapest place to stop
+# that is before the commit is merged.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: credential scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The history scan needs every commit, not just the tip: a credential
+          # that was committed and later deleted is still published and still
+          # readable.
+          fetch-depth: 0
+      - name: Scan tracked files and full history
+        run: |
+          bash scripts/check-secrets.sh
+          bash scripts/check-secrets.sh --history
+        # .secrets-denylist is git-ignored, so this job runs with the generic
+        # patterns only. That is intentional: the deny-list holds this
+        # deployment's real values and must never reach CI or the repository.
+
+  build:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out="$(gofmt -s -l . | grep -v '^vendor/' || true)"
+          if [ -n "$out" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$out"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test ./... -count=1 -timeout 1500s
