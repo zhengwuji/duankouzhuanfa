@@ -954,6 +954,19 @@ async function showApp(session) {
   $('#brand-version').textContent = 'v' + ((session.version || {}).version || '?');
   $('#mode-badge').textContent = session.mode || '';
 
+  // A server-only console has no client, and the relay/tunnel/health views all
+  // read the client half of the configuration. Offering them produced a hard
+  // 400 ("this process is not running a client") on click, which reads as a
+  // broken console rather than as a feature this mode does not have.
+  const mode = session.mode || '';
+  const clientViews = ['servers', 'tunnels', 'health'];
+  const hasClient = mode === 'client' || mode === 'both';
+  for (const btn of document.querySelectorAll('.nav-item')) {
+    if (clientViews.includes(btn.dataset.view)) btn.hidden = !hasClient;
+  }
+  // Land on a view this mode actually has.
+  if (!hasClient && clientViews.includes(state.view)) state.view = 'dashboard';
+
   if (!state.transports.length) {
     try {
       const data = await api('/api/v1/transports');

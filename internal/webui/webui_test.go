@@ -415,3 +415,43 @@ func TestIsSecretKey(t *testing.T) {
 		}
 	}
 }
+
+// TestStaticHandlerAnswersUnknownAPIPathsWith404 proves a mistyped endpoint is
+// reported as missing rather than being answered with the single-page shell.
+//
+// The catch-all static handler falls back to index.html so a deep link works on
+// refresh, and that fallback used to swallow /api/ as well: an unknown endpoint
+// returned 200 with HTML, so a caller saw success and then failed parsing HTML
+// as JSON, and a probe could not distinguish a missing endpoint from a present
+// one.
+func TestStaticHandlerAnswersUnknownAPIPathsWith404(t *testing.T) {
+	s := &Server{}
+	h := s.staticHandler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/does-not-exist", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown API path returned %d, want 404 (body starts %q)", rec.Code, firstBytes(rec.Body.String(), 40))
+	}
+	if ct := rec.Header().Get("Content-Type"); strings.Contains(ct, "text/html") {
+		t.Errorf("unknown API path was answered with HTML (%s)", ct)
+	}
+
+	// A real client-side route must still get the shell, or a refresh on a deep
+	// link would break.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/some/client/route", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("client-side route returned %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "<title>") {
+		t.Errorf("client-side route did not serve the shell: %q", firstBytes(rec.Body.String(), 60))
+	}
+}
+
+func firstBytes(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}

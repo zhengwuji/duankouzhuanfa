@@ -53,8 +53,16 @@ func (s *Server) staticHandler() http.Handler {
 		}
 
 		if _, err := fs.Stat(sub, name); err != nil {
-			// An unknown path is a client-side route, so the shell is served
-			// and the front end's router resolves it.
+			// An unknown API path is not a client-side route. Without this the
+			// shell was served with a 200 for a mistyped endpoint, so a caller
+			// (or a script) saw success and then failed parsing HTML as JSON —
+			// and a probe could not tell a missing endpoint from a present one.
+			if name == "api" || strings.HasPrefix(name, "api/") {
+				writeError(w, http.StatusNotFound, "not_found", "unknown API endpoint: /%s", name)
+				return
+			}
+			// Any other unknown path is a client-side route, so the shell is
+			// served and the front end's router resolves it.
 			serveIndex(w, r, sub)
 			return
 		}

@@ -211,6 +211,11 @@ generate_config() {
     return
   fi
 
+  # 只有真的走到 init 才会有新密码被打印出来。show_result 依赖这个标志决定
+  # 要不要提醒「密码只显示一次」：保留既有配置时没有任何密码出现在屏幕上，
+  # 却警告用户保存一个并不存在的密码，会让人以为自己漏看了。
+  CONFIG_GENERATED=1
+
   info "生成中转配置"
   local args=(
     init
@@ -327,7 +332,14 @@ show_result() {
   printf '  %s重置密码%s  %s reset-password\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
   printf '  %s彻底卸载%s  bash %s --uninstall\n' "${BOLD}" "${RESET}" "$0" >&2
   echo >&2
-  warn "上面的管理员密码只显示一次，请立即保存。"
+
+  if [[ "${CONFIG_GENERATED}" -eq 1 ]]; then
+    warn "上面的管理员密码只显示一次，请立即保存。"
+  else
+    # 既有配置被保留，本次没有生成也没有打印任何密码。指一条能查到凭据的
+    # 明路，而不是让用户去找一个从未出现在屏幕上的密码。
+    printf '  %s管理员密码沿用原配置，可用上面的「查看凭据」或 reset-password 获取。%s\n' "${BOLD}" "${RESET}" >&2
+  fi
 }
 
 do_install() {
@@ -501,6 +513,7 @@ LINE_NAME=""
 ADMIN_PASSWORD=""
 ADMIN_USERNAME=""
 FORCE_CONFIG=0
+CONFIG_GENERATED=0
 KEEP_DATA=0
 ASSUME_YES=0
 SKIP_TUNE=0
