@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"porttransit/internal/config"
+	"porttransit/internal/logx"
 )
 
 // TestPasswordHashing proves a password is stored as a bcrypt hash and that
@@ -446,6 +447,68 @@ func TestStaticHandlerAnswersUnknownAPIPathsWith404(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "<title>") {
 		t.Errorf("client-side route did not serve the shell: %q", firstBytes(rec.Body.String(), 60))
+	}
+}
+
+// TestLoginEndpointThrottlesPasswordGuessing drives the real handler, because
+// the throttle is only worth having if it is actually wired into the login
+// path. A console exposed beyond loopback has nothing else between the internet
+// and every relay line on the host.
+func TestLoginEndpointThrottlesPasswordGuessing(t *testing.T) {
+	hash, err := HashPassword("the-real-password")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	s := &Server{
+		cfg: &config.Config{
+			WebUI: config.WebUIConfig{
+				Enabled:      true,
+				Listen:       "0.0.0.0:8787",
+				AllowRemote:  true,
+				Username:     "admin",
+				PasswordHash: hash,
+			},
+		},
+		log:      logx.Discard(),
+		sessions: newSessionStore(time.Hour),
+		logins:   newLoginThrottle(),
+	}
+
+	attempt := func(password string) int {
+		body := `{"username":"admin","password":"` + password + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
+		req.RemoteAddr = "203.0.113.7:40000"
+		rec := httptest.NewRecorder()
+		s.handleLogin(rec, req)
+		return rec.Code
+	}
+
+	// Wrong passwords are rejected, and after the free attempts the endpoint
+	// must stop answering at all — a 401 forever is still an unlimited guesser.
+	for i := 0; i < loginFailureFreeAttempts; i++ {
+		if code := attempt("wrong"); code != http.StatusUnauthorized {
+			t.Fatalf("wrong password %d returned %d, want 401", i+1, code)
+		}
+	}
+	blocked := 0
+	for i := 0; i < 3; i++ {
+		if code := attempt("wrong"); code == http.StatusTooManyRequests {
+			blocked++
+		}
+	}
+	if blocked == 0 {
+		t.Fatal("the login endpoint never returned 429, so password guessing is not throttled")
+	}
+
+	// The correct password must still work from a different source, or one
+	// attacker could deny the console to the operator.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/login",
+		strings.NewReader(`{"username":"admin","password":"the-real-password"}`))
+	req.RemoteAddr = "198.51.100.9:40000"
+	rec := httptest.NewRecorder()
+	s.handleLogin(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the correct password from an unrelated address returned %d, want 200: an attacker must not be able to lock the operator out", rec.Code)
 	}
 }
 

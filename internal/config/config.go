@@ -886,6 +886,13 @@ func validateClient(c *ClientConfig) []string {
 
 // isLoopbackListen reports whether a bind address is confined to the loopback
 // interface or a unix socket.
+// IsLoopbackListen reports whether a listen address stays on the local host.
+//
+// Exported because the command line needs the same judgement as Validate: it
+// refuses a public console address without the acknowledgement flag, and the
+// two must not disagree about what "public" means.
+func IsLoopbackListen(addr string) bool { return isLoopbackListen(addr) }
+
 func isLoopbackListen(addr string) bool {
 	if addr == "" {
 		return true

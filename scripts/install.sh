@@ -243,12 +243,27 @@ generate_config() {
     --mode server
     --transport "${TRANSPORT}"
     --force
+    --webui-listen "${WEBUI_LISTEN}"
   )
   [[ -n "${LISTEN}" ]] && args+=(--listen "${LISTEN}")
   [[ -n "${LINE_NAME}" ]] && args+=(--name "${LINE_NAME}")
+  [[ -n "${ADMIN_USERNAME}" ]] && args+=(--admin-user "${ADMIN_USERNAME}")
   [[ -n "${ADMIN_PASSWORD}" ]] && args+=(--admin-password "${ADMIN_PASSWORD}")
+  [[ "${WEBUI_ALLOW_REMOTE}" -eq 1 ]] && args+=(--webui-allow-remote)
 
-  "${BIN_PATH}" "${args[@]}"
+  # init 只在这一次运行里打印明文密码（配置里只存 bcrypt 哈希），所以输出必须
+  # 先接住再转发：既让用户看到完整凭据，也让脚本能把它提取出来，在最后的
+  # 「安装完成」横幅里连同控制台地址一起显示 —— 否则用户要在一屏滚动输出里
+  # 自己找那一行，而这行错过就再也拿不到了。
+  local out
+  if ! out="$("${BIN_PATH}" "${args[@]}" 2>&1)"; then
+    printf '%s\n' "${out}" >&2
+    die "生成配置失败"
+  fi
+  printf '%s\n' "${out}" >&2
+
+  ADMIN_PASSWORD_SHOWN="$(printf '%s\n' "${out}" | sed -n 's/^管理员密码：//p' | head -n1)"
+  ADMIN_USERNAME_SHOWN="$(printf '%s\n' "${out}" | sed -n 's/^管理员用户名：//p' | head -n1)"
 
   chmod 0600 "${CONFIG_PATH}"
   ok "配置已写入 ${CONFIG_PATH}"
@@ -319,7 +334,6 @@ start_service() {
 
 open_firewall() {
   local port="$1"
-  info "检查防火墙"
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 ${port}/tcp" || warn "ufw 放行失败，请手动执行：ufw allow ${port}/tcp"
@@ -339,15 +353,70 @@ open_firewall() {
   fi
 }
 
+# open_firewall 的标题只打一次。
+#
+# 它现在被调用两次（中转端口与控制台端口），每次都打标题会让输出出现两行
+# 相同的「检查防火墙」，看起来像脚本跑了两次。
+FIREWALL_ANNOUNCED=0
+ensure_firewall_open() {
+  local port="$1"
+  if [[ "${FIREWALL_ANNOUNCED}" -eq 0 ]]; then
+    info "检查防火墙"
+    FIREWALL_ANNOUNCED=1
+  fi
+  open_firewall "${port}"
+}
+
 show_result() {
   echo >&2
   printf '%s╭──────────────────────────────────────────────╮%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
   printf '%s│            PortTransit 安装完成              │%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
   printf '%s╰──────────────────────────────────────────────╯%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
   echo >&2
+
+  # 先给控制台入口：这是安装完最想立刻打开的东西。地址由二进制的
+  # show-console 算出来（通配绑定会换成主机自己的出口地址），因为
+  # "http://0.0.0.0:8787" 不是一个能打开的地址。
+  local console_url="" console_user="" console_listen=""
+  local line
+  while IFS= read -r line; do
+    case "${line}" in
+      url=*)      console_url="${line#url=}" ;;
+      username=*) console_user="${line#username=}" ;;
+      listen=*)   console_listen="${line#listen=}" ;;
+    esac
+  done < <("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null || true)
+
+  if [[ -n "${console_url}" ]]; then
+    printf '  %s网页控制台%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${console_url}" "${RESET}" >&2
+    [[ -n "${console_user}" ]] && printf '  %s管理员账号%s  %s\n' "${BOLD}" "${RESET}" "${console_user}" >&2
+    if [[ -n "${ADMIN_PASSWORD_SHOWN}" ]]; then
+      printf '  %s管理员密码%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${ADMIN_PASSWORD_SHOWN}" "${RESET}" >&2
+    fi
+    echo >&2
+
+    if [[ "${console_listen}" == 127.0.0.1:* || "${console_listen}" == localhost:* || "${console_listen}" == "[::1]:"* ]]; then
+      # 只监听本机时上面那个 URL 从外部打不开。直接把能用的命令给出来，
+      # 而不是让用户自己意识到这一点。
+      local cport="${console_listen##*:}"
+      printf '  %s控制台只监听本机%s，从外部浏览器打开需要一条 SSH 隧道：\n' "${BOLD}" "${RESET}" >&2
+      printf '      ssh -N -L %s:127.0.0.1:%s root@<服务器地址>\n' "${cport}" "${cport}" >&2
+      printf '      然后打开 %s\n' "${console_url}" >&2
+      echo >&2
+    else
+      # 公网可访问就必须说清楚风险：这个后台能改所有线路、还能通过 SSH
+      # 往别的服务器装服务端。提醒用户改密码，并说明已有防爆破。
+      warn "控制台可被公网访问（${console_listen}），请立即修改管理员密码。"
+      printf '      登录失败会递增锁定：前 5 次不惩罚，之后每次翻倍，最长锁 15 分钟。\n' >&2
+      printf '      只允许本机访问：重新执行安装并加 --webui-listen 127.0.0.1:8787\n' >&2
+      echo >&2
+    fi
+  fi
+
   printf '  %s服务状态%s  systemctl status %s\n' "${BOLD}" "${RESET}" "${BIN_NAME}" >&2
   printf '  %s实时日志%s  journalctl -u %s -f\n' "${BOLD}" "${RESET}" "${BIN_NAME}" >&2
   printf '  %s配置文件%s  %s\n' "${BOLD}" "${RESET}" "${CONFIG_PATH}" >&2
+  printf '  %s控制台信息%s  %s show-console\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
   printf '  %s查看凭据%s  %s show-credentials\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
   printf '  %s重置密码%s  %s reset-password\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
   if [[ -n "${SCRIPT_PATH}" ]]; then
@@ -366,7 +435,8 @@ show_result() {
   else
     # 既有配置被保留，本次没有生成也没有打印任何密码。指一条能查到凭据的
     # 明路，而不是让用户去找一个从未出现在屏幕上的密码。
-    printf '  %s管理员密码沿用原配置，可用上面的「查看凭据」或 reset-password 获取。%s\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s管理员密码沿用原配置；如需换一个，执行上面的 reset-password。%s\n' \
+      "${BOLD}" "${RESET}" >&2
   fi
 }
 
@@ -385,7 +455,18 @@ do_install() {
   # 从生成的配置里读出监听端口，用于防火墙放行与结果展示。
   local port
   port="$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"[^:]*:\([0-9]\+\).*/\1/p' "${CONFIG_PATH}" | head -n1)"
-  [[ -n "${port}" ]] && open_firewall "${port}"
+  [[ -n "${port}" ]] && ensure_firewall_open "${port}"
+
+  # 控制台绑定在非回环地址时也要放行，否则装完打印的公网链接根本连不上，
+  # 用户会以为是控制台坏了。端口从 show-console 读，避免与配置漂移。
+  local webui_listen webui_port
+  webui_listen="$("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null \
+    | sed -n 's/^listen=//p' | head -n1)"
+  if [[ -n "${webui_listen}" && "${webui_listen}" != 127.0.0.1:* \
+     && "${webui_listen}" != localhost:* && "${webui_listen}" != "[::1]:"* ]]; then
+    webui_port="${webui_listen##*:}"
+    [[ -n "${webui_port}" ]] && ensure_firewall_open "${webui_port}"
+  fi
 
   show_result
 }
@@ -509,6 +590,9 @@ PortTransit 一键脚本
   --name <名称>        线路名称，例如「上海中转」
   --admin-password <密码>  网页控制台管理员密码（默认随机生成）
   --admin-username <用户名> 网页控制台管理员用户名（默认 admin）
+  --webui-listen <地址>    网页控制台监听地址，默认 0.0.0.0:8787（公网可访问）
+  --webui-allow-remote     确认允许控制台监听非回环地址（默认已开启）
+                           只允许本机访问请用 --webui-listen 127.0.0.1:8787
   --force-config       覆盖已存在的配置
   --skip-tune          跳过内核网络调优（BBR 等），不写 /etc/sysctl.d
 
@@ -540,6 +624,15 @@ LISTEN=""
 LINE_NAME=""
 ADMIN_PASSWORD=""
 ADMIN_USERNAME=""
+# 控制台默认监听 0.0.0.0，装完就能直接用公网地址打开。管理后台因此暴露在
+# 网络上，只有密码一层防护 —— 因此登录失败会递增锁定（见 webui 的限流），
+# 并且安装完成时会把地址、用户名、密码一起打印出来。
+# 想只允许本机访问：--webui-listen 127.0.0.1:8787（外部访问走 SSH 隧道）。
+WEBUI_LISTEN="0.0.0.0:8787"
+WEBUI_ALLOW_REMOTE=1
+# init 打印出来的明文凭据，供「安装完成」横幅复用。
+ADMIN_PASSWORD_SHOWN=""
+ADMIN_USERNAME_SHOWN=""
 FORCE_CONFIG=0
 CONFIG_GENERATED=0
 KEEP_DATA=0
@@ -555,6 +648,8 @@ while [[ $# -gt 0 ]]; do
     --name)            LINE_NAME="${2:?--name 需要一个值}"; shift 2 ;;
     --admin-password)  ADMIN_PASSWORD="${2:?--admin-password 需要一个值}"; shift 2 ;;
     --admin-username)  ADMIN_USERNAME="${2:?--admin-username 需要一个值}"; shift 2 ;;
+    --webui-listen)    WEBUI_LISTEN="${2:?--webui-listen 需要一个值}"; shift 2 ;;
+    --webui-allow-remote) WEBUI_ALLOW_REMOTE=1; shift ;;
     --force-config)    FORCE_CONFIG=1; shift ;;
     --skip-tune)       SKIP_TUNE=1; shift ;;
     --uninstall)       ACTION="uninstall"; shift ;;
@@ -566,6 +661,13 @@ while [[ $# -gt 0 ]]; do
     *)                 die "未知参数：$1（使用 --help 查看用法）" ;;
   esac
 done
+
+# 监听地址不是回环就必须显式确认，与二进制侧同一条规则：两边判断不一致的话，
+# 脚本会先接受一个地址、再让 init 报错，用户看到的是半途失败。
+if [[ "${WEBUI_LISTEN}" != 127.0.0.1:* && "${WEBUI_LISTEN}" != localhost:* \
+   && "${WEBUI_LISTEN}" != "[::1]:"* && "${WEBUI_ALLOW_REMOTE}" -ne 1 ]]; then
+  die "--webui-listen ${WEBUI_LISTEN} 不是回环地址；把管理后台暴露到网络上需要同时加 --webui-allow-remote"
+fi
 
 # --port 只是 --listen 的简写，两者都给出时以 --listen 为准。
 if [[ -z "${LISTEN}" && -n "${PORT}" ]]; then

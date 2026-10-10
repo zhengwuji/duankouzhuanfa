@@ -11,6 +11,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -456,6 +459,185 @@ var CredentialKeyOrder = []string{
 	"psk", "uuid", "password", "method",
 	"publicKey", "shortId", "serverName",
 	"username", "network", "path", "flow", "fingerprint",
+}
+
+// ShowConsole prints everything needed to open the management console, as
+// key=value lines.
+//
+// It exists so the one-click installer can report the console address, the
+// username and the freshly generated password without embedding a JSON parser
+// or re-deriving the URL rule. The password is deliberately absent: the config
+// only stores a bcrypt hash, so the plaintext exists solely in the output of
+// the `init` run that created it. The installer therefore reads the URL and the
+// username from here and takes the password from that run.
+func ShowConsole(args []string) error {
+	fs := flag.NewFlagSet("show-console", flag.ContinueOnError)
+	var (
+		path   string
+		asJSON bool
+	)
+	fs.StringVar(&path, "config", ConfigPath, "配置文件路径")
+	fs.BoolVar(&asJSON, "json", false, "以 JSON 输出（保留兼容；默认输出 key=value）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("enabled=%v\n", cfg.WebUI.Enabled)
+	fmt.Printf("listen=%s\n", cfg.WebUI.Listen)
+	fmt.Printf("url=%s\n", ConsoleURL(cfg.WebUI.Listen, cfg.WebUI.TLS))
+	fmt.Printf("username=%s\n", cfg.WebUI.Username)
+	fmt.Printf("tls=%v\n", cfg.WebUI.TLS)
+	return nil
+}
+
+// ConsoleURL renders a webui listen address as a browsable URL.
+//
+// A wildcard bind is not a destination: "http://0.0.0.0:8787" names no host.
+// For a wildcard bind an address a remote browser can actually reach is
+// substituted; when none can be determined the loopback URL is reported, which
+// is at least true locally.
+//
+// Exported so the command line and the installer cannot disagree about what
+// address to print.
+func ConsoleURL(listen string, useTLS bool) string {
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return scheme + "://" + listen
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		if ip := reachableIP(); ip != "" {
+			return scheme + "://" + net.JoinHostPort(ip, port)
+		}
+		host = "127.0.0.1"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+// reachableIP returns an address a remote browser could use to reach this
+// host, or "" when only loopback is available.
+func reachableIP() string {
+	ip := OutboundIP()
+	if ip == "" {
+		return ""
+	}
+	if !isPrivateIP(ip) {
+		return ip
+	}
+	// The host is behind NAT: its interface address is on a private range, so
+	// it is no more reachable from outside than the wildcard it replaced.
+	// Reporting it would send the operator to an address their browser cannot
+	// open, which is exactly the problem this function exists to avoid.
+	// Asking an external service is the only way to learn the address the
+	// world actually sees.
+	if pub := PublicIP(); pub != "" {
+		return pub
+	}
+	// No public address could be learned. The private one is still correct for
+	// an operator on the same LAN, so it is reported rather than dropped — and
+	// the installer says out loud that it is a local address.
+	return ip
+}
+
+// isPrivateIP reports whether an address is on a range that is not routable
+// from the public internet.
+func isPrivateIP(s string) bool {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, cidr := range privateRanges {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+var privateRanges = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, s := range []string{
+		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", // RFC 1918
+		"100.64.0.0/10",  // CGNAT, used by carrier NAT
+		"169.254.0.0/16", // link local
+		"fc00::/7",       // IPv6 unique local
+	} {
+		if _, n, err := net.ParseCIDR(s); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// PublicIP asks a well-known service for this host's public address.
+//
+// It is best-effort and bounded: the installer is already downloading a binary
+// over the network, so one more short request is not a new dependency, but a
+// host with no outbound access must not be made to wait. An empty result means
+// "could not determine", never a guess.
+//
+// It is a variable so tests can substitute a deterministic answer: a unit test
+// must not depend on an external service being reachable, or it turns a
+// network outage into a red build.
+var PublicIP = func() string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, url := range publicIPServices {
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+		ip := net.ParseIP(strings.TrimSpace(string(body)))
+		if ip == nil || ip.IsLoopback() || isPrivateIP(ip.String()) {
+			// A service that answers with a private or malformed address is not
+			// telling the truth about this host, so it is not used.
+			continue
+		}
+		return ip.String()
+	}
+	return ""
+}
+
+// publicIPServices are asked in order. Two are listed because a single service
+// being blocked or down must not silently degrade the printed URL.
+var publicIPServices = []string{
+	"https://api.ipify.org",
+	"https://ifconfig.me/ip",
+}
+
+// OutboundIP reports the address this host would use to reach the internet.
+//
+// A UDP "connection" performs no handshake and sends no packet: it only makes
+// the kernel pick a source address for the route, which is the interface a
+// remote client lands on. It returns "" when there is no route, so a host
+// without internet access still gets a usable loopback URL rather than an
+// error.
+func OutboundIP() string {
+	c, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return ""
+	}
+	defer c.Close()
+	if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.String()
+	}
+	return ""
 }
 
 // ClientSettingsFor derives the client half of a relay's credentials.

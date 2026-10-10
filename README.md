@@ -69,7 +69,20 @@ wget https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/ins
 sudo bash install.sh --transport reality --port 443
 ```
 
-安装完成会打印**中转凭据**和**控制台初始密码**。密码只显示一次，请立刻保存。
+安装完成会打印**控制台地址、用户名、密码**，以及**中转凭据**。密码只显示一次，请立刻保存：
+
+```
+╭──────────────────────────────────────────────╮
+│            PortTransit 安装完成              │
+╰──────────────────────────────────────────────╯
+
+  网页控制台  http://203.0.113.10:8787
+  管理员账号  admin
+  管理员密码  xxxxxxxxxxxxxxxx
+
+  服务状态  systemctl status porttransit
+  ...
+```
 
 脚本的完整参数（`bash install.sh --help` 也是这份）：
 
@@ -80,9 +93,18 @@ sudo bash install.sh --transport reality --port 443
 --name <名称>             线路名称，例如「上海中转」
 --admin-password <密码>   控制台管理员密码（默认随机生成）
 --admin-username <用户名> 控制台管理员用户名（默认 admin）
+--webui-listen <地址>     控制台监听地址，默认 0.0.0.0:8787（公网可访问）
+--webui-allow-remote      确认允许控制台监听非回环地址（默认已开启）
 --force-config            覆盖已存在的配置（默认保留旧配置）
 --skip-tune               跳过内核网络调优，不写 /etc/sysctl.d
 ```
+
+> **控制台默认监听 `0.0.0.0:8787`，公网可直接打开**，装完就能用打印出来的地址
+> 登录。它只有密码一层防护，所以：登录失败会递增锁定（前 5 次不惩罚，之后每次
+> 翻倍，最长 15 分钟），并且**请立刻改掉随机密码**。
+> 只想本机访问就加 `--webui-listen 127.0.0.1:8787`，外部访问走 SSH 隧道：
+> `ssh -N -L 8787:127.0.0.1:8787 root@你的服务器`，然后打开 `http://127.0.0.1:8787`。
+> 服务器在 NAT 后面时，脚本会通过外部服务查出真实公网地址来拼这个链接。
 
 其他操作：
 
@@ -235,8 +257,8 @@ HTTPS_PROXY=http://127.0.0.1:8118 curl https://ifconfig.me
 ## 网页控制台
 
 服务端和客户端都带控制台：`config.Default()` 对两种模式都开启它，默认监听
-`127.0.0.1:8787`（仅本机，默认需要登录），所以服务端并不比客户端多一个对外
-攻击面——但它确实在监听一个管理端口，不要以为服务端上没有这个东西。
+`127.0.0.1:8787`（仅本机，默认需要登录）。一键脚本安装的服务端默认改成
+`0.0.0.0:8787`，详见下面「安全设计」。
 
 | 页面 | 作用 |
 |---|---|
@@ -254,11 +276,23 @@ HTTPS_PROXY=http://127.0.0.1:8118 curl https://ifconfig.me
 一个已登录的会话；`/api/v1/session` 本身就是「我现在登录了吗」的探针，
 未登录时返回未授权而不是数据。
 
+命令行也能查看控制台信息，不用去翻配置文件：
+
+```bash
+porttransit show-console        # 地址、用户名、是否启用
+porttransit show-credentials    # 中转凭据（客户端连接用）
+porttransit reset-password      # 换一个密码
+```
+
 ### 安全设计
 
-- 默认只监听 `127.0.0.1`。要对外暴露必须显式打开 `allowRemote` **并且**
-  设置密码，否则配置校验会直接拒绝启动。**服务端和客户端都是如此**——
-  服务端同样在 `127.0.0.1:8787` 提供控制台，它只是同样限制在本机。
+- 默认监听 `127.0.0.1`（`porttransit init` 的默认值）。要对外暴露必须显式
+  打开 `allowRemote` **并且**设置密码，否则配置校验会直接拒绝启动。
+  **一键脚本刻意把默认值改成 `0.0.0.0:8787`**，因为装完就想直接打开控制台；
+  它会在结果横幅里明确警告并把改回本机的方法打出来。
+- 登录失败按来源地址递增锁定：前 5 次不惩罚（密码管理器也会打错），之后
+  每次翻倍，最长 15 分钟。计数在成功登录后清零，15 分钟无失败也会过期。
+  **按来源隔离**，所以一个攻击者无法把运维锁在外面。
 - 会话是服务端持有的随机令牌，`HttpOnly` + `SameSite=Strict`。
 - 改密码会**踢掉所有会话**。
 - API 永远不回显密钥，返回 `__redacted__` 占位符；前端原样提交时后端会
@@ -278,6 +312,7 @@ porttransit init             生成配置文件
 porttransit install          安装为系统服务（需要 root）
 porttransit uninstall        彻底卸载
 porttransit reset-password   重置管理员密码
+porttransit show-console     打印控制台地址与用户名
 porttransit show-credentials 打印中转凭据
 
 porttransit tune             应用内核网络调优（BBR 等）

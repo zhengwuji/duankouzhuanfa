@@ -71,6 +71,8 @@ func main() {
 		err = install.ResetPassword(rest)
 	case "show-credentials":
 		err = install.ShowCredentials(rest)
+	case "show-console":
+		err = install.ShowConsole(rest)
 	case "fingerprint":
 		err = install.Fingerprint(rest)
 	case "tune":
@@ -117,6 +119,7 @@ func usage() {
   uninstall         彻底卸载（删除配置、数据、服务与可执行文件）
   reset-password    重置管理后台管理员密码
   show-credentials  打印中转服务端的连接凭据
+  show-console      打印网页控制台的地址与用户名
   fingerprint       计算中转服务端证书的 SHA-256 指纹（用于客户端 certFingerprint）
   tune              应用内核网络调优（BBR 等），中转性能的关键
 
@@ -234,6 +237,8 @@ func cmdInit(args []string) error {
 		addListener bool
 		adminPass   string
 		adminUser   string
+		webuiListen string
+		allowRemote bool
 		printCreds  bool
 	)
 	fs.StringVar(&path, "config", defaultConfigPath(), "写入的配置文件路径")
@@ -245,6 +250,8 @@ func cmdInit(args []string) error {
 	fs.BoolVar(&addListener, "add-listener", false, "在现有配置中追加一条中转监听，而不是覆盖整个配置")
 	fs.StringVar(&adminUser, "admin-user", "admin", "网页控制台管理员用户名")
 	fs.StringVar(&adminPass, "admin-password", "", "网页控制台管理员密码（留空则随机生成）")
+	fs.StringVar(&webuiListen, "webui-listen", "", "网页控制台监听地址，例如 0.0.0.0:8787（默认 127.0.0.1:8787）")
+	fs.BoolVar(&allowRemote, "webui-allow-remote", false, "允许网页控制台绑定非回环地址（等于把管理后台暴露在网络上）")
 	fs.BoolVar(&printCreds, "print-credentials", false, "生成后打印连接凭据（供自动部署读取）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -336,6 +343,27 @@ func cmdInit(args []string) error {
 	}
 	if !addListener || set["admin-user"] {
 		cfg.WebUI.Username = adminUser
+	}
+
+	// Exposing the console is opt-in and always explicit.
+	//
+	// config.Validate refuses a non-loopback listen without AllowRemote, so the
+	// acknowledgement and the address travel together: an operator who asks for
+	// a public console gets one, and nobody gets one by accident.
+	//
+	// On the append path these are left alone unless named, for the same reason
+	// the password is: adding a relay line must not silently move or expose a
+	// console the operator is already using.
+	if webuiListen != "" {
+		cfg.WebUI.Listen = webuiListen
+	}
+	if allowRemote {
+		cfg.WebUI.AllowRemote = true
+	}
+	// A public console without a password is refused by Validate; catching it
+	// here names the flag that caused it.
+	if !config.IsLoopbackListen(cfg.WebUI.Listen) && !cfg.WebUI.AllowRemote {
+		return fmt.Errorf("--webui-listen %s 不是回环地址；把管理后台暴露到网络上必须显式加 --webui-allow-remote", cfg.WebUI.Listen)
 	}
 
 	creds := map[string]string{}
@@ -481,7 +509,10 @@ func cmdInit(args []string) error {
 
 	fmt.Printf("已写入配置：%s\n", path)
 	fmt.Printf("运行模式：%s\n", cfg.Mode)
-	fmt.Printf("网页控制台：http://%s\n", cfg.WebUI.Listen)
+	// The console URL is printed as something an operator can paste into a
+	// browser. A wildcard bind address is not one: "http://0.0.0.0:8787" is
+	// not a destination, and it was what the one-click installer used to show.
+	fmt.Printf("网页控制台：%s\n", consoleURL(cfg.WebUI.Listen))
 	fmt.Printf("管理员用户名：%s\n", cfg.WebUI.Username)
 	fmt.Printf("管理员密码：%s\n", adminPassReport)
 	if cfg.Server != nil {
@@ -557,6 +588,16 @@ func cmdDeploy(args []string) error {
 	})
 }
 
+// consoleURL renders a webui listen address as a URL an operator can paste
+// into a browser.
+//
+// The rule lives in the install package because the one-click script reports
+// the same address through `show-console`; two copies would be two answers to
+// "what URL do I open".
+func consoleURL(listen string) string {
+	return install.ConsoleURL(listen, false)
+}
+
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	path := fs.String("config", defaultConfigPath(), "配置文件路径")
@@ -572,7 +613,7 @@ func cmdStatus(args []string) error {
 	fmt.Printf("配置文件：%s\n", *path)
 	fmt.Printf("运行模式：%s\n", cfg.Mode)
 	fmt.Printf("日志级别：%s\n", cfg.Log.Level)
-	fmt.Printf("网页控制台：%v  监听 %s\n", cfg.WebUI.Enabled, cfg.WebUI.Listen)
+	fmt.Printf("网页控制台：%v  %s\n", cfg.WebUI.Enabled, consoleURL(cfg.WebUI.Listen))
 	fmt.Println()
 
 	if cfg.Server != nil {

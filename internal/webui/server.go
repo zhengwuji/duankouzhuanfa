@@ -68,6 +68,10 @@ type Server struct {
 	cli    *client.Client
 
 	sessions *sessionStore
+	// logins throttles password guessing. It only matters when the console is
+	// exposed beyond loopback, but it is always active: an operator who
+	// misconfigures the bind should not also lose the protection.
+	logins *loginThrottle
 
 	mu       sync.Mutex
 	httpSrv  *http.Server
@@ -97,6 +101,7 @@ func New(opts Options) (*Server, error) {
 		relay:    opts.Server,
 		cli:      opts.Client,
 		sessions: newSessionStore(ttl),
+		logins:   newLoginThrottle(),
 	}, nil
 }
 

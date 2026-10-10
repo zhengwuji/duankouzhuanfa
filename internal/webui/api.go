@@ -32,6 +32,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Throttle before doing any password work. The bcrypt comparison is slow,
+	// which is what makes offline cracking expensive, but it also means an
+	// unlimited guesser costs the console real CPU per attempt.
+	remote := clientIP(r, s.cfg.WebUI.TrustedProxies)
+	if wait := s.logins.retryAfter(remote); wait > 0 {
+		s.log.Warn("management login throttled",
+			"remote", remote,
+			"username", body.Username,
+			"retryAfter", wait.Round(time.Second).String(),
+		)
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts",
+			"too many failed logins from this address; retry in %s", wait.Round(time.Second))
+		return
+	}
+
 	// The username is compared first and the password always verified, so a
 	// wrong username and a wrong password take the same time and neither
 	// reveals whether the account exists.
@@ -39,19 +55,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	passOK := VerifyPassword(s.cfg.WebUI.PasswordHash, body.Password)
 
 	if !userOK || !passOK {
+		lockout := s.logins.failure(remote)
 		s.log.Warn("failed management login",
-			"remote", clientIP(r, s.cfg.WebUI.TrustedProxies),
+			"remote", remote,
 			"username", body.Username,
+			"lockout", lockout.Round(time.Second).String(),
 		)
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid username or password")
 		return
 	}
 
-	token := s.sessions.create(clientIP(r, s.cfg.WebUI.TrustedProxies))
+	s.logins.success(remote)
+
+	token := s.sessions.create(remote)
 	ttl := s.cfg.WebUI.SessionTTL.Or(12 * time.Hour)
 	setSessionCookie(w, r, token, ttl)
 
-	s.log.Info("management login", "remote", clientIP(r, s.cfg.WebUI.TrustedProxies), "username", body.Username)
+	s.log.Info("management login", "remote", remote, "username", body.Username)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"username": s.cfg.WebUI.Username,
