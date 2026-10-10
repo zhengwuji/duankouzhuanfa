@@ -48,7 +48,10 @@ help:
 	@echo "  test-race    run the unit tests with the race detector"
 	@echo "  vet          run go vet"
 	@echo "  fmt          format the tree"
-	@echo "  lint         run gofmt -l and go vet (what CI enforces)"
+	@echo "  lint         run gofmt -l, go vet and the secret scan (what CI enforces)"
+	@echo "  check-secrets        scan tracked files for credentials"
+	@echo "  check-secrets-history  scan every commit (catches deleted secrets)"
+	@echo "  hooks        install the git hooks (core.hooksPath=.githooks)"
 	@echo "  cover        write a coverage profile and print the total"
 	@echo "  clean        remove build output"
 	@echo "  install      install into $(DESTDIR)/usr/local/bin"
@@ -113,6 +116,26 @@ lint:
 	@out=$$(gofmt -s -l . | grep -v '^vendor/' || true); \
 	if [ -n "$$out" ]; then echo "these files are not gofmt'd:"; echo "$$out"; exit 1; fi
 	go vet ./...
+	@# This repository is public and manages relay credentials, so a leak is
+	@# published the moment it is committed. Fail the lint rather than relying
+	@# on someone remembering to run the checker.
+	scripts/check-secrets.sh
+
+.PHONY: check-secrets
+check-secrets:
+	scripts/check-secrets.sh
+
+.PHONY: check-secrets-history
+check-secrets-history:
+	scripts/check-secrets.sh --history
+
+.PHONY: hooks
+hooks:
+	@# Commit the hooks directory rather than copying into .git/hooks, so every
+	@# clone gets the same protection from one command.
+	git config core.hooksPath .githooks
+	@chmod +x .githooks/* 2>/dev/null || true
+	@echo "git hooks installed (core.hooksPath=.githooks)"
 
 .PHONY: cover
 cover:

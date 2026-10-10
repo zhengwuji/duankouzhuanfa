@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit that carries credentials.
+#
+# Install with `make hooks` (which sets core.hooksPath to this directory).
+#
+# A hook is used rather than a CI job because the cost of a leak here is not
+# "a red build": this repository is public, and a PSK or console password that
+# reaches a pushed commit must be treated as compromised and rotated. Catching
+# it before the commit exists is the only point where the fix is free.
+set -Eeuo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# Only the staged content matters: the work tree may legitimately hold a local
+# config.json that the developer never intends to commit.
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+if [[ -z "$staged" ]]; then
+    exit 0
+fi
+
+# Patterns that are recognisable without knowing the deployment. The private-key
+# shape requires a long body so an obviously-fake fixture is not flagged.
+patterns=(
+    'BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----.[A-Za-z0-9+/]{40,}'
+    '^[A-Za-z0-9+/]{60,}={0,2}$'
+    'ssh-rsa AAAA[0-9A-Za-z+/]{100,}'
+    'gh[pousr]_[A-Za-z0-9]{20,}'
+    'github_pat_[A-Za-z0-9_]{20,}'
+    'sk-[A-Za-z0-9]{20,}'
+    'AKIA[0-9A-Z]{16}'
+    'AIza[0-9A-Za-z_-]{35}'
+    '(password|passwd|psk|secret|token|apikey|api_key)[[:space:]]*[:=][[:space:]]*"[^"$]{8,}"'
+)
+
+# This deployment's literal values, if the operator keeps a deny-list. It is
+# git-ignored, so the real values are never themselves committed.
+denylist=()
+if [[ -f .secrets-denylist ]]; then
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [[ -n "$line" ]] && denylist+=("$line")
+    done < .secrets-denylist
+fi
+
+failed=0
+for f in $staged; do
+    # Skip deletions and binary blobs: a compiled binary embeds field names such
+    # as "passwordHash" and would produce nothing but noise.
+    [[ -f "$f" ]] || continue
+    if ! grep -qI . "$f" 2>/dev/null; then
+        continue
+    fi
+
+    # The staged version, not the work-tree version: a partially staged file
+    # would otherwise be checked in its unstaged state.
+    content="$(git show ":$f" 2>/dev/null || true)"
+    [[ -n "$content" ]] || continue
+
+    for pat in "${patterns[@]}"; do
+        hit="$(printf '%s\n' "$content" | grep -nE -- "$pat" | grep -v 'check-secrets:allow' || true)"
+        if [[ -n "$hit" ]]; then
+            echo "  $f: $hit" >&2
+            failed=1
+        fi
+    done
+    for lit in "${denylist[@]:-}"; do
+        [[ -n "$lit" ]] || continue
+        hit="$(printf '%s\n' "$content" | grep -nF -- "$lit" | grep -v 'check-secrets:allow' || true)"
+        if [[ -n "$hit" ]]; then
+            echo "  $f: $hit" >&2
+            failed=1
+        fi
+    done
+done
+
+if [[ $failed -ne 0 ]]; then
+    cat >&2 <<'EOF'
+
+COMMIT REFUSED: the staged content looks like it carries credentials.
+
+Remove the value (or replace it with an obviously-fake fixture) and commit
+again. `git commit --no-verify` bypasses this, but a credential that reaches a
+pushed commit must be rotated: assume it is compromised.
+
+To also scan the whole existing history, run: make check-secrets-history
+EOF
+    exit 1
+fi

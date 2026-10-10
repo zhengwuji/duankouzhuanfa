@@ -21,3 +21,8 @@
 Thumbs.db
 .idea/
 .vscode/
+# Literal values that must never be published: host addresses, SSH passwords,
+# relay PSKs, console password hashes. Read by scripts/check-secrets.sh, which
+# is committed while this file is not — so the checker can catch this
+# deployment's own values without publishing them in the pattern list.
+.secrets-denylist
