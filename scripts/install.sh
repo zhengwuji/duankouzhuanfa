@@ -35,6 +35,21 @@ readonly SYSCTL_PATH="/etc/sysctl.d/99-porttransit.conf"
 readonly RED=$'\033[31m'; readonly GREEN=$'\033[32m'; readonly YELLOW=$'\033[33m'
 readonly BLUE=$'\033[34m'; readonly BOLD=$'\033[1m'; readonly RESET=$'\033[0m'
 
+# The path this script was read from, or empty when it came from a pipe.
+#
+# The documented way to run this installer is `curl … | bash -s -- …`, and in
+# that form $0 is literally "bash". Printing it produced the instruction
+# "bash bash --uninstall", which cannot work — so the self path is only kept
+# when the script really is a file on disk.
+SCRIPT_PATH=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+
+# Where a fresh copy of this script can be fetched. Only used in the piped
+# form, where there is no local file to point at.
+readonly SCRIPT_URL="${PORTTRANSIT_SCRIPT_URL:-https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh}"
+
 # 输出统一走 stderr，这样 stdout 可以留给机器读取的内容。
 info()  { printf '%s==>%s %s\n' "${BLUE}${BOLD}" "${RESET}" "$*" >&2; }
 ok()    { printf '%s✔%s %s\n' "${GREEN}" "${RESET}" "$*" >&2; }
@@ -43,7 +58,12 @@ die()   { printf '%s✘%s %s\n' "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    die "需要 root 权限。请使用：sudo bash $0 $*"
+    # $0 is "bash" in the documented `curl … | bash -s -- …` form, so the hint
+    # is built from the real script path when there is one.
+    if [[ -n "${SCRIPT_PATH}" ]]; then
+      die "需要 root 权限。请使用：sudo bash ${SCRIPT_PATH} $*"
+    fi
+    die "需要 root 权限。请用 sudo 运行，例如：curl -fsSL ${SCRIPT_URL} | sudo bash -s -- $*"
   fi
 }
 
@@ -330,7 +350,15 @@ show_result() {
   printf '  %s配置文件%s  %s\n' "${BOLD}" "${RESET}" "${CONFIG_PATH}" >&2
   printf '  %s查看凭据%s  %s show-credentials\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
   printf '  %s重置密码%s  %s reset-password\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
-  printf '  %s彻底卸载%s  bash %s --uninstall\n' "${BOLD}" "${RESET}" "$0" >&2
+  if [[ -n "${SCRIPT_PATH}" ]]; then
+    printf '  %s彻底卸载%s  bash %s --uninstall\n' "${BOLD}" "${RESET}" "${SCRIPT_PATH}" >&2
+  else
+    # Piped install: there is no script file on disk to re-run, and $0 is
+    # "bash". The installer's own binary is the reliable way out — it carries
+    # the same uninstall logic the script delegates to.
+    printf '  %s彻底卸载%s  %s uninstall --yes\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
+    printf '              或用脚本卸载：curl -fsSL %s | bash -s -- --uninstall\n' "${SCRIPT_URL}" >&2
+  fi
   echo >&2
 
   if [[ "${CONFIG_GENERATED}" -eq 1 ]]; then
