@@ -91,7 +91,9 @@ type TuneResult struct {
 	CongestionControl string
 	// QueueDiscipline is the value in effect afterwards.
 	QueueDiscipline string
-	// BBRSupported reports whether the kernel offered bbr at all.
+	// BBRSupported reports whether bbr is in effect afterwards, decided by the
+	// read-back of tcp_congestion_control rather than by what the kernel
+	// advertised beforehand.
 	BBRSupported bool
 	// Writable is false in containers where /proc/sys is read-only.
 	Writable bool
@@ -109,7 +111,11 @@ func (r TuneResult) Summary() string {
 	}
 	parts := []string{fmt.Sprintf("拥塞控制 %s", r.CongestionControl), fmt.Sprintf("队列规则 %s", r.QueueDiscipline)}
 	if !r.BBRSupported {
-		parts = append(parts, "内核不支持 BBR，已改用缓冲区与连接数调优")
+		// Deliberately not "内核不支持 BBR": the usual reason is an absent
+		// tcp_bbr module or a read-only /proc/sys, and asserting the kernel
+		// lacks the algorithm would send the operator looking in the wrong
+		// place. What is certain is that it is not in effect.
+		parts = append(parts, "BBR 未生效，已改用缓冲区与连接数调优")
 	}
 	if len(r.Skipped) > 0 {
 		parts = append(parts, fmt.Sprintf("%d 项未生效", len(r.Skipped)))
@@ -144,12 +150,19 @@ func TuneKernel(persist bool) (TuneResult, error) {
 		return res, fmt.Errorf("install: 内核调优只支持 Linux（当前是 %s）", runtime.GOOS)
 	}
 
-	// bbr has to be probed before it can be set: the module may not be loaded
-	// yet, and asking for an unavailable algorithm fails the whole write.
-	res.BBRSupported = bbrAvailable()
-	if res.BBRSupported {
-		_ = exec.Command("modprobe", "tcp_bbr").Run()
-		res.BBRSupported = bbrAvailable()
+	// bbr is probed, not merely detected.
+	//
+	// Most kernels ship tcp_bbr as a module that nothing pulls in at boot, so a
+	// freshly provisioned host advertises neither bbr in
+	// tcp_available_congestion_control nor the module in lsmod — which is the
+	// common case for exactly the machines this runs on. The module is loaded
+	// when bbr is *missing*, not when it is present.
+	//
+	// Loading it here is belt-and-braces: the write below is what actually
+	// decides (see there), but an accurate availability list makes the reported
+	// state and the `--show` preview agree with reality.
+	if !bbrAvailable() {
+		loadBBRModule()
 	}
 
 	// Every setting is attempted independently. A restricted container often
@@ -177,12 +190,21 @@ func TuneKernel(persist bool) (TuneResult, error) {
 	for _, s := range sysctlSettings {
 		apply(s.Key, s.Value)
 	}
-	if res.BBRSupported {
-		apply(congestionControlKey, "bbr")
-	}
+
+	// bbr is requested unconditionally and judged by the read-back, because
+	// "is bbr in tcp_available_congestion_control?" is not the question that
+	// matters. Linux autoloads the algorithm's module when one is written to
+	// tcp_congestion_control, so on a host where tcp_bbr was never loaded the
+	// list says no and the write still succeeds — gating on the list is what
+	// made this report "内核不支持 BBR" on machines that support it fine.
+	//
+	// A kernel with no bbr at all rejects the write, which lands in Skipped
+	// like any other refused setting.
+	apply(congestionControlKey, "bbr")
 
 	res.CongestionControl = readSysctl(congestionControlKey)
 	res.QueueDiscipline = readSysctl("net.core.default_qdisc")
+	res.BBRSupported = res.CongestionControl == "bbr"
 
 	if persist && res.Writable {
 		content := SysctlContent(res.BBRSupported)
@@ -219,9 +241,45 @@ func sysctlFilePath(key string) string {
 	return filepath.Join(sysctlRoot, filepath.FromSlash(strings.ReplaceAll(key, ".", "/")))
 }
 
-// bbrAvailable reports whether the kernel offers the bbr algorithm.
+// bbrAvailable reports whether the kernel currently offers the bbr algorithm.
+//
+// A false result does not mean bbr is unusable: an unloaded tcp_bbr module is
+// absent from this list and still works once loaded. Use bbrModulePresent for
+// the "could it work here" question.
 func bbrAvailable() bool {
 	return strings.Contains(readSysctl("net.ipv4.tcp_available_congestion_control"), "bbr")
+}
+
+// loadBBRModule asks the kernel to load tcp_bbr.
+//
+// Failures are ignored on purpose: a kernel with bbr built in needs nothing,
+// and one without it cannot be helped from here. Whether bbr actually took
+// effect is decided by the write and its read-back, never by this call.
+func loadBBRModule() {
+	_ = bbrLoader()
+}
+
+// bbrLoader is where the module load happens. It is a variable so tests can
+// exercise the tuning pass without running modprobe on the test host.
+var bbrLoader = func() error {
+	if runtime.GOOS != "linux" {
+		return errors.New("not linux")
+	}
+	return exec.Command("modprobe", "tcp_bbr").Run()
+}
+
+// bbrModulePresent reports whether the kernel ships an unloaded tcp_bbr module.
+//
+// This is the read-only companion to loadBBRModule, for `tune --show`, which
+// must preview what a real run would do without modifying the host. Without it
+// the preview would omit bbr on exactly the freshly provisioned hosts where a
+// real run does set it.
+func bbrModulePresent() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	out, err := exec.Command("modinfo", "-n", "tcp_bbr").Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
 // writeSysctl sets one parameter.
@@ -276,7 +334,12 @@ func Tune(args []string) error {
 	if show {
 		// The preview is generated from the same source as the real thing, so
 		// what an operator reviews is exactly what would be applied.
-		fmt.Print(SysctlContent(bbrAvailable()))
+		//
+		// bbr counts as available when the algorithm is offered *or* the module
+		// merely exists: a real run loads the module and then sets bbr, so a
+		// preview that only checked the live list would hide the most important
+		// line on a fresh host.
+		fmt.Print(SysctlContent(bbrAvailable() || bbrModulePresent()))
 		return nil
 	}
 

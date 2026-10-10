@@ -170,7 +170,7 @@ func (c *Client) Start(ctx context.Context) error {
 
 	if c.cfg.Health.Enabled && len(c.cfg.Servers) > 0 {
 		c.pools.setHealthThresholds(c.cfg.Health)
-		c.health = newHealthChecker(c.cfg.Health, c.pools, c.log)
+		c.health = newHealthChecker(c.cfg.Health, c.pools, c.log, c.stats)
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
@@ -655,7 +655,7 @@ func (c *Client) ProbeNow(ctx context.Context, serverID string) error {
 	if !ok {
 		return fmt.Errorf("client: relay %q is not configured", serverID)
 	}
-	checker := newHealthChecker(c.cfg.Health, c.pools, c.log)
+	checker := newHealthChecker(c.cfg.Health, c.pools, c.log, c.stats)
 	checker.probe(ctx, entry)
 	return nil
 }

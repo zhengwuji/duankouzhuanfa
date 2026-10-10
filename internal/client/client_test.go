@@ -290,6 +290,36 @@ func TestRecordProbeLatency(t *testing.T) {
 	}
 }
 
+// TestHealthCheckerAccountsForItsProbes proves the health counters the console
+// reports are actually incremented. They were declared, serialized and reset but
+// never written, so the management interface showed a permanent zero for
+// "checks" and "failures" while probes were running the whole time — an operator
+// watching those numbers would conclude health checking was broken.
+func TestHealthCheckerAccountsForItsProbes(t *testing.T) {
+	pools := newPoolSet([]config.ServerEntry{
+		{ID: "a", Address: "127.0.0.1:1", Transport: "tls", Enabled: true},
+	})
+	stats := &Stats{}
+	checker := newHealthChecker(config.HealthConfig{}, pools, nil, stats)
+
+	entry, ok := pools.ByID("a")
+	if !ok {
+		t.Fatal("the relay is missing from the pool")
+	}
+
+	// Port 1 has nothing listening, so this probe must fail — which is exactly
+	// the case the failure counter exists for.
+	checker.probe(context.Background(), entry)
+
+	snap := stats.Snapshot()
+	if snap.HealthChecks != 1 {
+		t.Errorf("healthChecks = %d after one probe, want 1", snap.HealthChecks)
+	}
+	if snap.HealthFailures != 1 {
+		t.Errorf("healthFailures = %d after one failed probe, want 1", snap.HealthFailures)
+	}
+}
+
 // TestServerEntrySettingsFillsStandardKeys proves the server name and client id
 // are injected into the transport settings, which is what makes the generic
 // transport code work without every transport knowing about them.

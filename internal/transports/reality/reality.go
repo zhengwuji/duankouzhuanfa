@@ -604,6 +604,27 @@ func decodeKey(s string) ([]byte, error) {
 	return nil, fmt.Errorf("reality: key %q is not valid base64", s)
 }
 
+// PublicKeyFromPrivate derives the base64 X25519 public key for a base64
+// private key.
+//
+// A relay's configuration stores only the private key, but a client needs the
+// public one. Without this, an operator who installed a relay and later wants
+// to add it to a client has no way to recover the public key: the relay's own
+// `show-credentials` cannot print what it never stored, and recomputing an
+// X25519 public key by hand is not something to ask of them. The output uses
+// raw URL-safe base64, matching what the installer generates.
+func PublicKeyFromPrivate(privateB64 string) (string, error) {
+	raw, err := decodeKey(privateB64)
+	if err != nil {
+		return "", err
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(raw)
+	if err != nil {
+		return "", fmt.Errorf("reality: %s is not an X25519 private key: %w", SettingPrivateKey, err)
+	}
+	return base64.RawURLEncoding.EncodeToString(priv.PublicKey().Bytes()), nil
+}
+
 // Dialer establishes client→relay REALITY streams.
 type Dialer struct{}
 

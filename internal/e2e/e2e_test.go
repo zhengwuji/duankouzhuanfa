@@ -432,6 +432,31 @@ func TestMultipleConnectionsThroughOneTunnel(t *testing.T) {
 	}
 }
 
+// TestRelayStatsReportDialLatency proves the relay's average dial latency is
+// actually computable. DialLatencyMs was accumulated on every successful dial
+// while DialCount — the divisor Snapshot uses — was never incremented, so the
+// console's "average dial" figure read as a permanent zero no matter how much
+// traffic passed through.
+func TestRelayStatsReportDialLatency(t *testing.T) {
+	h := startHarness(t, "direct", map[string]any{"psk": randomPSK(t)}, nil)
+
+	const payload = "measure the dial"
+	if got := h.roundTrip(t, payload); got != payload {
+		t.Fatalf("echoed %q, want %q", got, payload)
+	}
+
+	snap := h.relay.Stats().Snapshot()
+	if snap.TotalConnections == 0 {
+		t.Fatal("the relay recorded no connections, so the harness did not exercise it")
+	}
+	// The count is asserted rather than the average: a loopback dial can round
+	// down to zero milliseconds, so a latency assertion here would be flaky
+	// while proving nothing about the bug, which was the missing divisor.
+	if snap.DialCount == 0 {
+		t.Error("dialCount = 0 after a successful relayed connection, so avgDialMs can never be computed")
+	}
+}
+
 // TestConcurrentConnectionsThroughOneTunnel proves the tunnel handles parallel
 // connections without mixing their streams, which is the failure mode a
 // shared-buffer bug produces.

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -87,17 +86,24 @@ func appendServerToConfig(path string, res *sshdeploy.Result) error {
 	// A relay whose address is already present is replaced rather than
 	// duplicated, so re-running a deployment repairs the entry instead of
 	// leaving two copies that point at the same host.
-	settings := map[string]any{}
-	for k, v := range res.Settings {
-		settings[k] = v
-	}
+	//
+	// The settings go through the same translation the "init --mode both" path
+	// uses. Copying the relay's reported credentials straight in looks
+	// equivalent but is not: a client entry also needs the fields the relay
+	// does not have — "insecure" for a freshly generated self-signed
+	// certificate, and "tls": false for the schemes the relay serves in the
+	// clear. Without them a deployed relay is recorded correctly and then
+	// fails every handshake on the user's machine.
 	entry := config.ServerEntry{
-		ID:        "srv-" + shortID(),
-		Name:      firstNonEmpty(res.Settings["name"], res.Address),
+		ID: "srv-" + shortID(),
+		// The listener name is preferred over the address because a host can
+		// carry several lines on different ports, and "relay-jp-2" tells the
+		// operator more than a second copy of the same IP does.
+		Name:      firstNonEmpty(res.Name, res.Settings["name"], res.Address),
 		Address:   res.Address,
 		Transport: res.Transport,
 		Enabled:   true,
-		Settings:  settings,
+		Settings:  ClientSettingsFor(res.Transport, res.Settings),
 	}
 
 	for i := range cfg.Client.Servers {
@@ -146,5 +152,3 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-
-var _ = filepath.Join

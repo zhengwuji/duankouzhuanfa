@@ -96,16 +96,18 @@ type healthChecker struct {
 	cfg   config.HealthConfig
 	pools *poolSet
 	log   *logx.Logger
+	stats *Stats
 
 	mu     sync.Mutex
 	probes map[string]int64
 }
 
-func newHealthChecker(cfg config.HealthConfig, pools *poolSet, log *logx.Logger) *healthChecker {
+func newHealthChecker(cfg config.HealthConfig, pools *poolSet, log *logx.Logger, stats *Stats) *healthChecker {
 	return &healthChecker{
 		cfg:    cfg,
 		pools:  pools,
 		log:    log,
+		stats:  stats,
 		probes: map[string]int64{},
 	}
 }
@@ -155,7 +157,7 @@ func (h *healthChecker) probe(ctx context.Context, e *serverEntry) {
 
 	dialer, err := transport.NewDialer(e.Transport)
 	if err != nil {
-		e.recordProbe(false, err, 0)
+		h.record(e, false, err, 0)
 		return
 	}
 
@@ -182,13 +184,29 @@ func (h *healthChecker) probe(ctx context.Context, e *serverEntry) {
 	})
 	rtt := time.Since(start)
 	if err != nil {
-		e.recordProbe(false, err, 0)
+		h.record(e, false, err, 0)
 		return
 	}
 	// A ping stream is answered and closed by the relay; a probe-target stream
 	// is a real connection and must be closed here.
 	_ = stream.Close()
-	e.recordProbe(true, nil, rtt)
+	h.record(e, true, nil, rtt)
+}
+
+// record applies a probe result and accounts for it.
+//
+// The counters live here rather than in recordProbe so that every path which
+// probes a relay is counted exactly once, including the failures that never
+// reach the dial (an unbuildable transport) and the console's on-demand
+// "test" button.
+func (h *healthChecker) record(e *serverEntry, ok bool, err error, rtt time.Duration) {
+	if h.stats != nil {
+		h.stats.HealthChecks.Add(1)
+		if !ok {
+			h.stats.HealthFailures.Add(1)
+		}
+	}
+	e.recordProbe(ok, err, rtt)
 }
 
 // recordProbe applies a probe result, including the hysteresis thresholds.

@@ -138,7 +138,11 @@ func run(base, user, pass string, tunnelPort int) error {
 		return fmt.Errorf("/api/v1/config redacted nothing, which suggests the view is not the redacted one")
 	}
 
-	// 8. Health must report the configured relay.
+	// 8. Health must report the configured relay — but only on an instance that
+	//    runs a client. A server-only relay has no relays to dial, so an empty
+	//    list there is correct rather than a failure; asserting otherwise makes
+	//    this tool unusable against exactly the hosts it is most useful on.
+	mode, _ := st["mode"].(string)
 	_, body, err = c.get("/api/v1/health", true)
 	if err != nil {
 		return err
@@ -150,10 +154,62 @@ func run(base, user, pass string, tunnelPort int) error {
 		return fmt.Errorf("decode /api/v1/health: %w", err)
 	}
 	health := healthResp.Servers
-	if len(health) == 0 {
-		return fmt.Errorf("/api/v1/health reported no relays")
+	if mode == "client" || mode == "both" {
+		if len(health) == 0 {
+			return fmt.Errorf("/api/v1/health reported no relays on a %s instance", mode)
+		}
+		fmt.Printf("      health: %v\n", health[0]["name"])
+	} else {
+		if len(health) != 0 {
+			return fmt.Errorf("/api/v1/health reported %d relays on a server-only instance", len(health))
+		}
+		fmt.Printf("      health: (server-only, no relays expected)\n")
 	}
-	fmt.Printf("      health: %v\n", health[0]["name"])
+
+	// 8b. A relay instance must describe its listeners, because that is how an
+	//     operator finds out that a port failed to bind. A bound listener with
+	//     no reason is the assertion: a listener that silently accepts nothing
+	//     is the failure this endpoint exists to surface.
+	if srv, ok := st["server"].(map[string]any); ok {
+		_, body, err = c.get("/api/v1/status", true)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(body, &st); err != nil {
+			return fmt.Errorf("decode /api/v1/status: %w", err)
+		}
+		srv, _ = st["server"].(map[string]any)
+		listeners, _ := srv["listeners"].([]any)
+		if len(listeners) == 0 {
+			return fmt.Errorf("/api/v1/status reported no listeners on a relay instance")
+		}
+		bound := 0
+		for _, raw := range listeners {
+			l, _ := raw.(map[string]any)
+			if listening, _ := l["listening"].(bool); listening {
+				bound++
+			} else if reason, _ := l["reason"].(string); reason != "" {
+				return fmt.Errorf("listener %v is not bound: %s", l["name"], reason)
+			}
+		}
+		if bound == 0 {
+			return fmt.Errorf("no listener is bound on a relay instance that reports %d", len(listeners))
+		}
+		fmt.Printf("      listeners: %d bound of %d\n", bound, len(listeners))
+
+		// 8c. The account endpoint must answer on a relay, since it is the only
+		//     place an operator can see and reset a used-up quota.
+		if _, body, err = c.get("/api/v1/accounts", true); err != nil {
+			return err
+		}
+		var acctResp struct {
+			Accounts []map[string]any `json:"accounts"`
+		}
+		if err := json.Unmarshal(body, &acctResp); err != nil {
+			return fmt.Errorf("decode /api/v1/accounts: %w", err)
+		}
+		fmt.Printf("      accounts: %d\n", len(acctResp.Accounts))
+	}
 
 	// 9. Logs must be retrievable, since that is how an operator debugs a relay
 	//    they cannot log into directly.

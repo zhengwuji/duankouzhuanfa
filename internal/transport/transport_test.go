@@ -273,6 +273,105 @@ func TestPreambleClientServerHandshake(t *testing.T) {
 	}
 }
 
+// TestServerHandshakeClearsTheWholeDeadline pins the fix for a bug that
+// silently truncated every stream slower than the handshake timeout.
+//
+// Callers bound their own handshake by calling SetDeadline (read *and* write)
+// and then hand the connection to PreambleServerHandshake. If the helper
+// clears only the read half, the write deadline stays armed and the first
+// write after it expires fails with i/o timeout — which the relay's copy loop
+// treats as end-of-stream, so a large or long-lived transfer is cut off with
+// no error logged anywhere.
+//
+// The test arms a short deadline on both halves, completes the handshake, then
+// sleeps past it and writes. Before the fix that write failed with
+// "i/o timeout"; after it, the byte arrives.
+func TestServerHandshakeClearsTheWholeDeadline(t *testing.T) {
+	psk := []byte("deadline-test-key")
+	const handshake = 300 * time.Millisecond
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	// Mimic a transport handler bounding its own handshake.
+	if err := server.SetDeadline(time.Now().Add(handshake)); err != nil {
+		t.Fatalf("arm deadline: %v", err)
+	}
+
+	type outcome struct {
+		stream Stream
+		err    error
+	}
+	serverCh := make(chan outcome, 1)
+	go func() {
+		s, err := PreambleServerHandshake(server, ServerHandshakeConfig{
+			PSK:           psk,
+			Timeout:       handshake,
+			AllowPing:     true,
+			TransportName: "test",
+		})
+		serverCh <- outcome{s, err}
+	}()
+
+	req := &Request{Command: CmdConnectTCP, Target: "example.com:443", Transport: "test"}
+	clientStream, err := PreambleClientHandshake(client, req, ClientHandshakeConfig{
+		PSK:           psk,
+		TransportName: "test",
+		Timeout:       3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	defer clientStream.Close()
+
+	res := <-serverCh
+	if res.err != nil {
+		t.Fatalf("server handshake: %v", res.err)
+	}
+	defer res.stream.Close()
+
+	// Let the caller's deadline expire, then write. The write direction must
+	// have been released by the handshake helper.
+	time.Sleep(handshake + 200*time.Millisecond)
+
+	// net.Pipe has no buffering, so the write needs a concurrent reader.
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 6)
+		if _, err := io.ReadFull(clientStream, buf); err != nil {
+			got <- nil
+			return
+		}
+		got <- buf
+	}()
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := res.stream.Write([]byte("late!!"))
+		writeErr <- err
+	}()
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("write after the handshake deadline expired failed: %v "+
+				"(the helper cleared only the read deadline, leaving the write deadline armed)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("write after the handshake deadline expired hung")
+	}
+
+	select {
+	case buf := <-got:
+		if string(buf) != "late!!" {
+			t.Fatalf("payload = %q, want late!!", buf)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the byte written after the deadline expired never arrived")
+	}
+}
+
 // TestPreambleServerRejectsWrongKey proves the relay closes rather than
 // serving a client whose key is wrong.
 func TestPreambleServerRejectsWrongKey(t *testing.T) {

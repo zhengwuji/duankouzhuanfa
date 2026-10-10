@@ -237,11 +237,20 @@ func fakeSysctlRoot(t *testing.T, keys ...string) string {
 }
 
 // withSysctlRoot points the package at a temporary tree for one test.
+//
+// It also stubs out the bbr module loader. A fake /proc/sys means the test is
+// simulating a kernel, so actually running modprobe on the test host would be
+// both pointless and a side effect on the developer's machine.
 func withSysctlRoot(t *testing.T, root string) {
 	t.Helper()
 	old := sysctlRoot
 	sysctlRoot = root
-	t.Cleanup(func() { sysctlRoot = old })
+	oldLoader := bbrLoader
+	bbrLoader = func() error { return nil }
+	t.Cleanup(func() {
+		sysctlRoot = old
+		bbrLoader = oldLoader
+	})
 }
 
 // This is the behaviour that matters: every setting is attempted on its own.
@@ -306,9 +315,15 @@ func TestTuneKernelReportsNothingWritable(t *testing.T) {
 	}
 }
 
-// bbr is only requested when the kernel actually offers it; asking for an
-// unavailable algorithm would fail and could take the whole file with it.
-func TestTuneKernelOnlySetsBBRWhenOffered(t *testing.T) {
+// The reported bbr state is decided by the read-back, not by what the kernel
+// advertised before the write.
+//
+// This is the regression that mattered in the field: Linux autoloads tcp_bbr
+// when bbr is written to tcp_congestion_control, so a freshly provisioned host
+// advertises "reno cubic" and still ends up on bbr. Gating on the advertised
+// list made the installer announce "内核不支持 BBR" on machines that support it
+// perfectly well.
+func TestTuneKernelSetsBBRWhenTheKernelAcceptsIt(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only")
 	}
@@ -317,9 +332,50 @@ func TestTuneKernelOnlySetsBBRWhenOffered(t *testing.T) {
 		"net.ipv4.tcp_congestion_control",
 	)
 	withSysctlRoot(t, root)
-	// No bbr in the offered list.
+	// bbr is absent from the advertised list, as on an unloaded module.
 	if err := os.WriteFile(filepath.Join(root, "net/ipv4/tcp_available_congestion_control"),
 		[]byte("reno cubic\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "net/ipv4/tcp_congestion_control"),
+		[]byte("cubic\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := TuneKernel(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.BBRSupported {
+		t.Error("the kernel accepted bbr but it was reported as unsupported")
+	}
+	if res.CongestionControl != "bbr" {
+		t.Errorf("result reports %q, want bbr", res.CongestionControl)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "net/ipv4/tcp_congestion_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "bbr" {
+		t.Errorf("congestion control is %q, want bbr", strings.TrimSpace(string(got)))
+	}
+}
+
+// And when the kernel genuinely has no bbr, the refusal must be reported rather
+// than papered over. A directory in place of the knob makes the write fail the
+// way an unknown algorithm does, without depending on running as non-root.
+func TestTuneKernelReportsBBRWhenTheKernelRefusesIt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux only")
+	}
+	root := fakeSysctlRoot(t, "net.ipv4.tcp_available_congestion_control")
+	withSysctlRoot(t, root)
+	if err := os.WriteFile(filepath.Join(root, "net/ipv4/tcp_available_congestion_control"),
+		[]byte("reno cubic\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The knob exists but cannot be written, so bbr never takes effect.
+	if err := os.MkdirAll(filepath.Join(root, "net/ipv4/tcp_congestion_control"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -328,18 +384,16 @@ func TestTuneKernelOnlySetsBBRWhenOffered(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.BBRSupported {
-		t.Fatal("bbr reported as supported although the kernel does not offer it")
+		t.Error("bbr was reported as supported although the write was refused")
 	}
-	got, err := os.ReadFile(filepath.Join(root, "net/ipv4/tcp_congestion_control"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(got)) == "bbr" {
-		t.Error("set bbr on a kernel that does not offer it")
+	if _, ok := res.Skipped[congestionControlKey]; !ok {
+		t.Errorf("a refused %s was not reported in the skipped list", congestionControlKey)
 	}
 }
 
-func TestTuneKernelSetsBBRWhenOffered(t *testing.T) {
+// A write that is accepted but silently discarded must not count as bbr taking
+// effect, for the same reason the other settings are read back.
+func TestTuneKernelDoesNotClaimBBROnADiscardedWrite(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only")
 	}
@@ -352,23 +406,20 @@ func TestTuneKernelSetsBBRWhenOffered(t *testing.T) {
 		[]byte("reno cubic bbr\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Read-only knob: writing fails for a normal user, and root's write is
+	// caught by the read-back below either way.
+	if err := os.Chmod(filepath.Join(root, "net/ipv4/tcp_congestion_control"), 0o444); err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := TuneKernel(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.BBRSupported {
-		t.Fatal("bbr was offered but not detected")
-	}
-	got, err := os.ReadFile(filepath.Join(root, "net/ipv4/tcp_congestion_control"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(got)) != "bbr" {
-		t.Errorf("congestion control is %q, want bbr", strings.TrimSpace(string(got)))
-	}
-	if res.CongestionControl != "bbr" {
-		t.Errorf("result reports %q, want bbr", res.CongestionControl)
+	// Whatever happened, the two must agree — that is the invariant.
+	if res.BBRSupported != (res.CongestionControl == "bbr") {
+		t.Errorf("BBRSupported=%v but congestion control reads %q",
+			res.BBRSupported, res.CongestionControl)
 	}
 }
 

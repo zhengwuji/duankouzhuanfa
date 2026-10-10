@@ -38,7 +38,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **多种加密协议** | TLS / REALITY / VLESS / VMess / Trojan / Shadowsocks-2022 / WebSocket / HTTPUpgrade / SOCKS5 / 直连 |
+| **多种加密协议** | TLS / REALITY / VLESS / VMess / Trojan / Shadowsocks-2022 / `ws`（WebSocket）/ HTTPUpgrade / HTTP CONNECT / SOCKS5 / 直连 |
 | **网页控制台** | 添加服务器、配置转发规则、查看线路健康、实时日志、一键改密码 |
 | **远程部署** | 控制台里填 SSH 信息，自动给远程服务器装好服务端并回填凭据 |
 | **一键脚本** | `install.sh` 负责安装、彻底卸载、重置管理员密码 |
@@ -71,6 +71,19 @@ sudo bash install.sh --transport reality --port 443
 
 安装完成会打印**中转凭据**和**控制台初始密码**。密码只显示一次，请立刻保存。
 
+脚本的完整参数（`bash install.sh --help` 也是这份）：
+
+```bash
+--transport <名称>        中转协议，默认 tls（见「中转协议」表）
+--port <端口>             中转监听端口，默认 8443
+--listen <地址>           完整监听地址，例如 0.0.0.0:443（优先于 --port）
+--name <名称>             线路名称，例如「上海中转」
+--admin-password <密码>   控制台管理员密码（默认随机生成）
+--admin-username <用户名> 控制台管理员用户名（默认 admin）
+--force-config            覆盖已存在的配置（默认保留旧配置）
+--skip-tune               跳过内核网络调优，不写 /etc/sysctl.d
+```
+
 其他操作：
 
 ```bash
@@ -81,6 +94,9 @@ sudo bash install.sh --uninstall         # 彻底卸载（含配置与数据）
 sudo bash install.sh --uninstall --keep-data   # 卸载但保留配置
 sudo bash install.sh --uninstall --yes   # 卸载时不询问（脚本/自动化里必须加）
 ```
+
+> 重装或改协议时注意 `--force-config` 的默认行为：**不带它就会保留已有配置**，
+> 所以只改 `--transport` 而不加 `--force-config` 不会生效，看起来像参数没被读到。
 
 > `--uninstall` 会删掉配置与数据，所以默认要输入 `yes` 确认。非交互环境
 > （CI、Ansible 等）请显式加 `--yes`，否则脚本会拒绝执行而不是默默删库。
@@ -101,12 +117,59 @@ porttransit init --mode client --config ./client.json
 porttransit run --config ./client.json
 ```
 
-启动后打开控制台：<http://127.0.0.1:8787>
+`init` 会把生成的**管理员用户名（默认 `admin`）和密码**打在终端上，请先记下来。
+Windows 上不写 `--config` 时的默认位置是 `%APPDATA%\porttransit\config.json`，
+Linux 普通用户是 `~/.config/porttransit/config.json`（见「配置文件」）。
 
-在 **中转服务器** 页面点「添加中转服务器」，填入第一步拿到的地址和凭据。
-然后在 **远程部署** 页面可以直接通过 SSH 给新服务器安装服务端，装完自动回填。
+启动后打开控制台：<http://127.0.0.1:8787>，**先用上面那组用户名密码登录**——
+控制台是一个需要登录的管理界面，没登录时看到的只有登录表单。密码只保存哈希，
+`init` 之后找不回来；忘了就用 `porttransit reset-password` 或
+`sudo bash install.sh --reset-password` 重新生成。
+
+#### 1. 登录控制台，填入中转凭据
+
+登录后在 **中转服务器** 页面点「添加中转服务器」。表单字段是
+名称 / 服务器地址 / 协议 / 分组 / 线路标记 / 客户端 ID / 协议参数 (JSON) / 启用。
+
+关键的一点：安装脚本打印的 `psk`、`uuid`、`password`、`publicKey` 这些值
+**要作为 JSON 对象填进「协议参数」框**，不是一行一个字段。例如 `tls`：
+
+```json
+{ "psk": "base64:...", "insecure": true }
+```
+
+`reality`：
+
+```json
+{ "psk": "...", "publicKey": "...", "shortId": "...", "serverName": "www.bing.com" }
+```
+
+这些值从哪里来：
+
+- 安装脚本在装完时打印过一遍。
+- 之后在中转机上随时可以重新取回：`porttransit show-credentials`，输出是
+  `key=value` 一行一项（REALITY 的 `publicKey` 由服务端保存的私钥现算出来，
+  所以安装时没抄下来也拿得回）。
+- 服务端自己的控制台（同一个 `127.0.0.1:8787`）也能生成这些值。
+
+`insecure: true` 只是让自签证书不被拒绝；如果能拿到证书指纹，请改用
+`certFingerprint`（见「证书指纹固定」）。
+
+#### 2. 新建转发规则
+
+**端口转发** 页面点「+ 新建转发」，字段是：本地监听地址 / 目标地址 /
+指定服务器 / 分组 / 传输类型（TCP | UDP）/ 负载策略。
+
+例如把本地 `127.0.0.1:25565` 直接转发到 `mc.example.com:25565`，走中转线路。
+**新增或改动监听端口后需要重启客户端才会真正绑定**，控制台保存时会提示这一点；
+只改目标地址之类的软配置才热生效。
+
+负载策略可选 `first`（默认，按配置顺序）/ `round-robin` / `random` /
+`least-latency`（延迟最低）。
 
 ### 三、使用
+
+#### 本地代理
 
 客户端默认在本地开两个代理端口：
 
@@ -122,8 +185,19 @@ curl --socks5 127.0.0.1:1080 https://ifconfig.me
 curl --proxy  127.0.0.1:8118 https://ifconfig.me
 ```
 
-固定端口转发在 **端口转发** 页面配置，例如把本地 `127.0.0.1:25565` 直接
-转发到 `mc.example.com:25565`，走中转线路。
+浏览器一般用 SwitchyOmega 这类扩展指向 `127.0.0.1:1080`（SOCKS5）；命令行
+工具则可以直接给环境变量：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:8118 curl https://ifconfig.me
+```
+
+> **本地代理默认没有认证**，并且默认只绑定回环地址。这是刻意的——它靠
+> 「只有本机能连」来防护，而不是靠密码。所以**不要**把 `socks5Listen` /
+> `httpListen` 改成 `0.0.0.0`：那等于把你自己的出口代理开放给整个网络。
+> 真要对外暴露，配置校验会强制你同时设置代理密码，但仍应优先考虑别这么做。
+
+固定端口转发同样在 **端口转发** 页面配置。
 
 ---
 
@@ -139,13 +213,13 @@ curl --proxy  127.0.0.1:8118 https://ifconfig.me
 | `vmess` | ✅ | 443 | 兼容 v2ray 生态的旧客户端 |
 | `trojan` | ✅ | 443 | 未认证流量转发到真实网站，伪装成 HTTPS |
 | `shadowsocks` | ✅ | 8388 | Shadowsocks-2022，自带重放防护 |
-| `websocket` | ❌ | 8080 | 能穿 CDN 和公司代理 |
+| `ws` | ❌ | 8080 | WebSocket，能穿 CDN 和公司代理 |
 | `httpupgrade` | ❌ | 80 | WebSocket 形状握手但不分帧，开销更低 |
 | `http` | ❌ | 8080 | 标准 HTTP CONNECT 代理 |
 | `socks5` | ❌ | 1080 | 标准 SOCKS5，便于串联 |
 | `direct` | ❌ | 8080 | 只做转发不加密，**仅限内网或已有隧道** |
 
-> **明文协议警告**：`websocket`、`httpupgrade`、`http`、`socks5`、`direct`
+> **明文协议警告**：`ws`、`httpupgrade`、`http`、`socks5`、`direct`
 > 只保护不了内容。如果这一段链路要经过公网，请选带 ✅ 的协议，或者把这些
 > 协议套在 SSH / WireGuard 之类已经加密的隧道里。
 
@@ -153,14 +227,16 @@ curl --proxy  127.0.0.1:8118 https://ifconfig.me
 
 - **不确定选什么** → `tls`
 - **被墙得厉害、需要抗探测** → `reality`
-- **要过 CDN** → `websocket`
+- **要过 CDN** → `ws`
 - **要给现成的 SOCKS5 客户端用** → `socks5`
 
 ---
 
 ## 网页控制台
 
-客户端独有（服务端不监听任何管理端口，少一个攻击面）。
+服务端和客户端都带控制台：`config.Default()` 对两种模式都开启它，默认监听
+`127.0.0.1:8787`（仅本机，默认需要登录），所以服务端并不比客户端多一个对外
+攻击面——但它确实在监听一个管理端口，不要以为服务端上没有这个东西。
 
 | 页面 | 作用 |
 |---|---|
@@ -172,10 +248,17 @@ curl --proxy  127.0.0.1:8118 https://ifconfig.me
 | **日志** | 按级别过滤的实时日志 |
 | **设置** | 改管理员账号密码、直接编辑配置、查看可用协议 |
 
+控制台自身由 `http://127.0.0.1:8787` 提供，它的 JSON API 挂在 `/api/v1/` 下
+（例如 `/api/v1/config`、`/api/v1/tunnels`、`/api/v1/status`）。除
+`/api/v1/login`、`/api/v1/logout` 和 `/api/v1/session` 之外，所有端点都要求
+一个已登录的会话；`/api/v1/session` 本身就是「我现在登录了吗」的探针，
+未登录时返回未授权而不是数据。
+
 ### 安全设计
 
 - 默认只监听 `127.0.0.1`。要对外暴露必须显式打开 `allowRemote` **并且**
-  设置密码，否则配置校验会直接拒绝启动。
+  设置密码，否则配置校验会直接拒绝启动。**服务端和客户端都是如此**——
+  服务端同样在 `127.0.0.1:8787` 提供控制台，它只是同样限制在本机。
 - 会话是服务端持有的随机令牌，`HttpOnly` + `SameSite=Strict`。
 - 改密码会**踢掉所有会话**。
 - API 永远不回显密钥，返回 `__redacted__` 占位符；前端原样提交时后端会
@@ -197,9 +280,19 @@ porttransit uninstall        彻底卸载
 porttransit reset-password   重置管理员密码
 porttransit show-credentials 打印中转凭据
 
+porttransit tune             应用内核网络调优（BBR 等）
+porttransit fingerprint      计算中转服务端证书的 SHA-256 指纹
+
 porttransit deploy           通过 SSH 远程安装服务端
 porttransit version          版本信息
+porttransit help             显示命令帮助
 ```
+
+`show-credentials` 按 `key=value` 一行一项打印客户端连接所需的全部字段——
+包括 REALITY 的 `publicKey`（由服务端保存的私钥现算出来）、`shortId` 和
+`serverName`，所以凭据在安装时打印过一次之后仍然可以随时取回。
+
+`tune` 的用法见下面的「性能调优」，`fingerprint` 的用法见「证书指纹固定」。
 
 常用参数：
 
@@ -240,6 +333,45 @@ porttransit deploy --host 1.2.3.4 --user root \
 `{os}` / `{arch}` 会按服务器实际平台替换。网页控制台的「远程部署」页也有
 对应的「服务端下载地址」输入框。
 
+### 在已有线路的服务器上再部署一条
+
+`deploy` 是**追加**线路，不会动服务器上已有的其它线路。往一台已经跑着
+relay 的服务器上再部署第二条，两条都会保留：
+
+```bash
+# 第一次：装 tls 线路到 8443
+porttransit deploy --host 1.2.3.4 --transport tls --port 8443 --name relay-a
+
+# 第二次：同一台服务器再加一条 reality 线路到 9443
+porttransit deploy --host 1.2.3.4 --transport reality --port 9443 --name relay-b
+# 服务器上现在有 2 条线路，relay-a 不受影响
+```
+
+几点行为说明：
+
+- **同名即更新**：用同一个 `--name` 重跑，是修复那一条线路，而不是留下两条
+  抢同一个端口的重复项。
+- **端口被别的程序占用会直接拒绝**：所有线路在同一个进程里，一条线路绑不上
+  端口会让整个服务起不来，连带把已经正常的线路一起弄挂。所以部署前会先检查
+  端口，被其它程序占用时就停下并说明，不改动配置。
+- **失败会回滚**：新配置启动失败或端口没监听时，会自动恢复部署前的配置并重启，
+  不会把一台本来正常的服务器留在一个起不来的配置上。
+- **管理员密码不会被改动**：追加线路不会重新生成控制台密码（重新生成会把你
+  锁在控制台外面，而那个新密码根本不会显示出来）。要改密码用
+  `porttransit reset-password` 或安装脚本的 `--reset-password`。
+- **端口没监听 = 部署失败**：以前这里只是一条警告，所以会出现「提示部署成功、
+  实际端口没开」的情况；现在会明确报失败并打印服务日志。
+
+用 `--force` 覆盖、或者想手工在服务器上追加线路时，可以用：
+
+```bash
+porttransit init --config /etc/porttransit/config.json --add-listener \
+  --transport vless --listen 0.0.0.0:10443 --name relay-c
+
+# 只看某一条线路的凭据（默认只输出第一条已启用的）
+porttransit show-credentials --config /etc/porttransit/config.json --name relay-c
+```
+
 ---
 
 ## 配置文件
@@ -277,16 +409,92 @@ porttransit deploy --host 1.2.3.4 --user root \
       }
     ],
     "forwards": [],
+    "clients": [
+      {
+        "id": "laptop-01",
+        "name": "家里的笔记本",
+        "enabled": true,
+        "credentials": {
+          "tls": "base64:...",
+          "reality": "..."
+        },
+        "allowedTargets": ["example.com:443"],
+        "deniedTargets": ["169.254.169.254:80"],
+        "maxConnections": 64,
+        "rateLimitKBps": 2048,
+        "quotaBytes": 107374182400,
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "note": "按季度续期"
+      }
+    ],
     "acl": { "blockPrivate": true },
     "limits": {
       "handshakeTimeout": "10s",
       "idleTimeout": "300s",
       "dialTimeout": "10s",
       "bufferSize": 32768
+    },
+    "resolver": {
+      "servers": ["1.1.1.1:53", "8.8.8.8:53"],
+      "protocol": "udp",
+      "timeout": "5s",
+      "strategy": "prefer_ipv4"
+    },
+    "masking": {
+      "mode": "none",
+      "fallbackAddr": "www.bing.com:443",
+      "fallbackServerName": "www.bing.com",
+      "fallbackHTTPHost": "www.bing.com",
+      "sniff": false
     }
   }
 }
 ```
+
+`server.clients`（账号策略）的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 客户端在 `clientId` 里上报的标识，也是策略的键 |
+| `name` / `note` | 给人看的标签 |
+| `enabled` | 关掉即停用该账号，不用删配置 |
+| `credentials` | **按传输名做键**的子映射，一个账号可以同时持有多种协议的密钥 |
+| `allowedTargets` / `deniedTargets` | 在全局 ACL 之上再收窄；拒绝优先于允许 |
+| `maxConnections` | 并发上限，`0` 为不限 |
+| `rateLimitKBps` | 限速（KB/s），`0` 为不限 |
+| `quotaBytes` | 累计流量上限，`0` 为不限；用量持久化在 `dataDir/quota.json` |
+| `expiresAt` | 到期时间（RFC3339）；不填表示永不过期 |
+
+一旦配置了**任意一个**账号，策略就分成两种情形：
+
+- 在能携带 `clientId` 的传输上（前导帧类：`direct` / `tls` / `ws` /
+  `httpupgrade` / `reality`），未知或不存在的 `clientId` 会被**直接拒绝**。
+  否则任何人换个 id 就能绕过按客户端的策略，账号功能形同虚设。
+- 在自带共享密钥的传输上（`vless` / `trojan` / `shadowsocks` / `socks5` /
+  `http`），认证靠的是协议头里的密钥本身，客户端无法自选身份。这类连接
+  只由它自己的密钥管辖：匹配到账号就套用该账号的限额，匹配不到就按全局策略
+  放行——严格拒绝会把「刚加了一个 id 不巧等于密钥的账号」变成全体断线。
+
+`server.resolver` 覆盖中转机侧的目标解析：`servers`（DNS 地址列表）、
+`protocol`（`udp` / `tcp` / `tcp-tls` / `https`）、`timeout`、`strategy`
+（`prefer_ipv4` / `prefer_ipv6`）。
+
+`server.masking` 决定未认证的探测者看到什么：`mode`
+（`none` / `tls-fallback` / `http-fallback`）、`fallbackAddr`、
+`fallbackServerName`、`fallbackHTTPHost`、`certFile` / `keyFile`、`sniff`。
+它**只对 `trojan` / `http` / `httpupgrade` / `ws` 生效**——这四个协议有地方
+可以把未认证流量转出去。配在其他协议上会打一条警告而不是静默失效，否则
+运维会以为探测已经处理好了。
+
+listener 与 forward 上还有几个容易漏的开关：`listener.tcpFastOpen`（需要在
+bind 之前设置才有效，非 Linux 平台会明确告知已忽略）、`listener.mptcp`、
+`listener.proxyProtocol`（接受入站 PROXY protocol v1/v2，让中转机在负载均衡
+后面也能看到真实客户端地址），以及 `forward.proxyProtocolOut`（出站时加 v1
+头，让目标看到原始客户端地址）。
+
+转发规则里的 `balance` 可选 `first` / `round-robin` / `random` /
+`least-latency` / `least-conn`；客户端隧道和本地代理的 `balance` 少一个
+`least-conn`（它们选的是中转线路，不是目标主机）。
 
 ### 客户端示例
 
@@ -302,6 +510,7 @@ porttransit deploy --host 1.2.3.4 --user root \
         "name": "上海中转",
         "address": "sh.example.com:8443",
         "transport": "tls",
+        "clientId": "laptop-01",
         "enabled": true,
         "group": "primary",
         "latencyTag": "日本→上海→美国",
@@ -374,8 +583,9 @@ porttransit deploy --host 1.2.3.4 --user root \
 | `chrome`（默认） | 复刻 Chrome 的 ClientHello |
 | `firefox` / `safari` / `edge` / `ios` / `android` | 对应浏览器 |
 | `golang` | Go 自带 TLS 栈的指纹 |
-| `random` | 每次连接重新打乱扩展顺序，指纹不固定 |
+| `random`（别名 `randomized`） | 每次连接重新打乱扩展顺序，指纹不固定 |
 | `random-no-alpn` | 同上，但不带 ALPN |
+| `none` | 不使用 uTLS，走标准库 `crypto/tls` 握手 |
 
 > `random` 两档是在**真实 Chrome 指纹**的基础上打乱扩展顺序实现的——这正是
 > Chrome 106+ 自己做的事，所以既真实又每次都不同。它们**不会**像 uTLS 自带的
@@ -436,9 +646,20 @@ UDP 隧道按「本地源地址」维护独立的上游会话：同一个本地�
 数据包复用一条中转连接，空闲 60 秒自动回收，因此不会为每个数据包做一次
 握手。
 
-UDP 转发依赖中转协议本身能承载数据报。`socks5`、`vless`、`vmess`、`trojan`
-显式实现了 UDP 关联命令；`direct` 通过前导帧承载（已由测试覆盖）。
-`shadowsocks`、`ws`、`httpupgrade`、REALITY 请使用 TCP。
+UDP 转发依赖中转协议本身能承载数据报：
+
+- `direct` / `tls` / `ws` / `httpupgrade` / `reality` 通过**前导帧**承载
+  UDP——和中继 TCP 走的是同一条 `PreambleServerHandshake` 路径，中转机只看
+  前导帧里的命令字节来决定开 TCP 还是 UDP 关联，所以这些协议在实现上都支持。
+- `vless` / `vmess` / `trojan` / `socks5` 在**自己的协议头**里实现 UDP 命令，
+  同样支持。
+- `shadowsocks` 和 `http`（HTTP CONNECT）不支持 UDP：这两个实现的 relay 端
+  都只构造 `CmdConnectTCP`——Shadowsocks 的请求格式里没有 UDP 关联这一说，
+  而 HTTP CONNECT 本身表达的也只是一个 TCP 隧道。
+
+不过「实现上支持」不等于「已经替你验证过」：自动化覆盖到的是 `socks5` 与
+`direct`，其余组合请自己在你的线路和客户端版本上先跑一遍
+`curl --socks5 127.0.0.1:1080` 之类的实测，再投入生产。
 
 ### 浏览器代理的 UDP（DNS 与 QUIC）
 
@@ -475,7 +696,7 @@ UDP 转发依赖中转协议本身能承载数据报。`socks5`、`vless`、`vme
 
 ```
 ==> 内核网络调优
-✔ 拥塞控制：bbr  队列规则：fq
+✔ 拥塞控制 bbr，队列规则 fq
 ```
 
 ### 手动运行 / 预览
@@ -509,7 +730,10 @@ sudo bash install.sh --skip-tune   # 安装时跳过调优
 
 - **容器 / WSL**：`/proc/sys` 只读或部分可写，脚本会逐项尝试并报告哪些没生效，
   而不是整体跳过。
-- **内核不支持 BBR**（4.9 以下）：只调整缓冲区与连接数，并明确告知。
+- **BBR 未生效**（内核 4.9 以下，或 `tcp_bbr` 模块缺失）：只调整缓冲区与连接数，
+  并明确告知。脚本会先尝试 `modprobe tcp_bbr`，再直接写入 `tcp_congestion_control`
+  并以**读回结果**判断是否生效——内核会在写入时自动加载算法模块，所以
+  `tcp_available_congestion_control` 里没有 bbr 并不代表不能用。
 - **写入被静默丢弃**：脚本会**读回校验**，不会把没生效的参数报成成功。
 
 想确认当前状态：
@@ -603,6 +827,21 @@ cat /etc/sysctl.d/99-porttransit.conf
 2. 建立加密隧道，把「要访问谁」告诉中转服务端
 3. 服务端做目的地策略检查，然后连上真正的目标
 4. 双向透传，按空闲超时和限速收尾
+
+### 负载均衡策略
+
+客户端（隧道与本地代理）在分组内按 `balance` 挑线路：
+
+| 取值 | 行为 |
+|---|---|
+| `first`（默认） | 保持配置顺序，列表里的第一个可用节点优先——先主后备的直觉写法 |
+| `round-robin` | 按秒轮转，同一秒内的连接落在同一个节点，突发流量不会扇出到所有上游 |
+| `random` | 随机打乱 |
+| `least-latency` | 延迟最低优先；从未测过的节点排在最后，所以第一条连接会先赌已知快的 |
+
+服务端的转发规则（`server.forwards[].balance`，用在 `target` 写了多个逗号
+分隔主机时）另外多一个 `least-conn`，按当前连接数最少挑。写错的值会被配置
+校验拒绝，而不是静默退回默认。
 
 ### 健康检查与故障切换
 
@@ -807,13 +1046,21 @@ scripts/install.sh        一键脚本
 
 - 证书指纹 pin：`settings.certFingerprint`，让自签证书的中转不再必须用
   `insecure: true`（那等于完全不校验服务端）。
+- 新增 `porttransit fingerprint` 命令：`--cert <证书文件>` 读本地证书，
+  `--server <地址>` 直接连运行中的中转服务端取证书，输出 `key=value` 形式的
+  SHA-256 指纹，可以直接抄进客户端的 `certFingerprint`。服务端启动日志里也会
+  打一次自己的指纹。
+- `settings.fingerprint` 补齐文档：接受 `chrome` / `firefox` / `safari` /
+  `edge` / `ios` / `android` / `golang` / `random`（别名 `randomized`）/
+  `random-no-alpn` / `none`，其中 `none` 走标准库 `crypto/tls` 握手而不使用
+  uTLS。写错档位名会直接报错，不会静默退回默认值。
 
 ### v1.0.0 — 首个版本
 
 **传输协议**
 
-- 支持 10 种中转协议：`tls`、`reality`、`vless`、`vmess`、`trojan`、
-  `shadowsocks`、`ws`、`httpupgrade`、`socks5`、`direct`
+- 支持 11 种中转协议：`tls`、`reality`、`vless`、`vmess`、`trojan`、
+  `shadowsocks`、`ws`、`httpupgrade`、`http`（HTTP CONNECT）、`socks5`、`direct`
 - TLS 支持浏览器指纹伪装（Chrome / Firefox / Safari / Edge / iOS / Android /
   Golang），另有两个随机档位 `random`、`random-no-alpn`——
   它们从**真实 Chrome 指纹**派生并在每次连接时打乱扩展顺序，
@@ -841,7 +1088,8 @@ scripts/install.sh        一键脚本
 - 线路健康探测与**迟滞**判断（连续失败才退休，连续成功才恢复），
   避免网络抖动导致线路反复横跳
 - 固定端口转发（TCP 与 UDP）
-- 多线路分组、多种负载均衡策略
+- 多线路分组、多种负载均衡策略（`first` / `round-robin` / `random` /
+  `least-latency`，服务端转发规则另外支持 `least-conn`）
 
 **一键部署**
 

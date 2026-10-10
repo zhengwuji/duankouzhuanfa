@@ -225,15 +225,16 @@ func runApp(cf commonFlags) error {
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	var (
-		path       string
-		mode       string
-		listen     string
-		transport  string
-		name       string
-		force      bool
-		adminPass  string
-		adminUser  string
-		printCreds bool
+		path        string
+		mode        string
+		listen      string
+		transport   string
+		name        string
+		force       bool
+		addListener bool
+		adminPass   string
+		adminUser   string
+		printCreds  bool
 	)
 	fs.StringVar(&path, "config", defaultConfigPath(), "写入的配置文件路径")
 	fs.StringVar(&mode, "mode", "server", "运行模式：server / client / both")
@@ -241,6 +242,7 @@ func cmdInit(args []string) error {
 	fs.StringVar(&transport, "transport", "tls", "中转协议")
 	fs.StringVar(&name, "name", "", "该中转线路的名称")
 	fs.BoolVar(&force, "force", false, "覆盖已存在的配置文件")
+	fs.BoolVar(&addListener, "add-listener", false, "在现有配置中追加一条中转监听，而不是覆盖整个配置")
 	fs.StringVar(&adminUser, "admin-user", "admin", "网页控制台管理员用户名")
 	fs.StringVar(&adminPass, "admin-password", "", "网页控制台管理员密码（留空则随机生成）")
 	fs.BoolVar(&printCreds, "print-credentials", false, "生成后打印连接凭据（供自动部署读取）")
@@ -248,8 +250,25 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	if _, err := os.Stat(path); err == nil && !force {
-		return fmt.Errorf("%s 已存在；如需覆盖请加 --force", path)
+	// Which flags the caller actually named, as opposed to which ones carry a
+	// default. Appending a listener must not disturb the account or the mode,
+	// so those two are only touched when they were asked for by name.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	exists := false
+	if _, err := os.Stat(path); err == nil {
+		exists = true
+	}
+
+	if addListener && force {
+		return errors.New("--add-listener 与 --force 互斥：前者在现有配置上追加，后者覆盖它")
+	}
+	if exists && !force && !addListener {
+		return fmt.Errorf("%s 已存在；如需覆盖请加 --force，如需追加线路请加 --add-listener", path)
+	}
+	if addListener && !exists {
+		return fmt.Errorf("%s 不存在，无法追加线路；去掉 --add-listener 可直接创建新配置", path)
 	}
 
 	m := config.Mode(strings.ToLower(mode))
@@ -259,21 +278,65 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("--mode 只能是 server、client 或 both，收到 %q", mode)
 	}
 
-	cfg := config.Default(m)
+	var cfg *config.Config
+	if addListener {
+		loaded, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		cfg = loaded
+		if cfg.Server == nil {
+			return fmt.Errorf("--add-listener 需要服务端配置，但 %s 没有 server 段", path)
+		}
+		if set["mode"] && cfg.Mode != m {
+			return fmt.Errorf("--add-listener 不能更改运行模式（现有 %s，请求 %s）：追加线路必须保留其余设置", cfg.Mode, m)
+		}
+	} else {
+		cfg = config.Default(m)
+		// config.Default seeds a placeholder listener (relay-tls on 0.0.0.0:8443)
+		// so a hand-written configuration has an example to follow. It is not
+		// operator intent, and leaving it in place while adding the requested
+		// line would bind a TLS relay nobody asked for — and, when the request
+		// itself is tls on 8443, collide with the placeholder. A fresh
+		// generation starts from an empty list.
+		if cfg.Server != nil {
+			cfg.Server.Listeners = nil
+		}
+	}
 
 	// The management password is generated rather than left empty: a console
 	// with no password is a console anyone on the host can open, and an
 	// operator who is told the generated password will change it, while one
 	// who is told "set a password" may not.
-	if adminPass == "" {
-		adminPass = randomPassword()
+	//
+	// Appending a listener is the exception, and it preserves the existing
+	// hash. Regenerating it would silently lock the operator out of a console
+	// they are already using — and the replacement would never even be seen,
+	// because the deployment path reads credentials back and never looks at
+	// the console password.
+	adminPassReport := ""
+	switch {
+	case adminPass != "":
+		hash, err := hashPassword(adminPass)
+		if err != nil {
+			return err
+		}
+		cfg.WebUI.PasswordHash = hash
+		adminPassReport = adminPass
+	case addListener:
+		adminPassReport = "未更改（沿用现有配置）"
+	default:
+		pw := randomPassword()
+		hash, err := hashPassword(pw)
+		if err != nil {
+			return err
+		}
+		cfg.WebUI.PasswordHash = hash
+		adminPassReport = pw
 	}
-	hash, err := hashPassword(adminPass)
-	if err != nil {
-		return err
+	if !addListener || set["admin-user"] {
+		cfg.WebUI.Username = adminUser
 	}
-	cfg.WebUI.Username = adminUser
-	cfg.WebUI.PasswordHash = hash
 
 	creds := map[string]string{}
 
@@ -301,57 +364,111 @@ func cmdInit(args []string) error {
 			l.Settings["certFile"] = "/etc/porttransit/certs/relay.crt"
 			l.Settings["keyFile"] = "/etc/porttransit/certs/relay.key"
 		case "vless", "vmess":
-			u := newUUID()
-			l.Settings["uuid"] = u
-			creds["uuid"] = u
+			l.Settings["uuid"] = newUUID()
 		case "trojan":
-			pw := randomPassword()
-			l.Settings["password"] = pw
-			creds["password"] = pw
+			l.Settings["password"] = randomPassword()
 			l.Settings["fallbackAddr"] = "www.bing.com:443"
 		case "shadowsocks":
-			key := generateSSKey(transport)
 			l.Settings["method"] = "2022-blake3-chacha20-poly1305"
-			l.Settings["password"] = key
-			creds["method"] = "2022-blake3-chacha20-poly1305"
-			creds["password"] = key
+			l.Settings["password"] = generateSSKey(transport)
 		case "reality":
-			priv, pub := generateRealityKeyPair()
+			priv, _ := generateRealityKeyPair()
 			l.Settings["privateKey"] = priv
 			l.Settings["shortId"] = generateShortID()
 			l.Settings["dest"] = "www.bing.com:443"
 			l.Settings["serverNames"] = []string{"www.bing.com"}
-			creds["publicKey"] = pub
-			creds["shortId"] = fmt.Sprint(l.Settings["shortId"])
-			creds["serverName"] = "www.bing.com"
 		case "socks5":
-			user, pass := "pt", randomPassword()
-			l.Settings["username"] = user
-			l.Settings["password"] = pass
-			creds["username"] = user
-			creds["password"] = pass
+			l.Settings["username"] = "pt"
+			l.Settings["password"] = randomPassword()
 		}
-		creds["psk"] = psk
-		creds["transport"] = transport
-		creds["listen"] = listen
-		creds["name"] = l.Name
 
-		cfg.Server.Listeners = []config.Listener{l}
+		// Listeners are appended, never replaced. Replacing them meant that
+		// running this command — which is exactly what the remote deployment
+		// path runs — silently deleted every relay already configured on the
+		// host, while the deployment still reported success. An operator
+		// adding a second line to a server would lose the first one.
+		//
+		// Re-adding the same endpoint is treated as an update, so a repeated
+		// deployment repairs its own line instead of accumulating duplicates
+		// that cannot bind the port they both claim.
+		replaced := false
+		for i := range cfg.Server.Listeners {
+			if cfg.Server.Listeners[i].Name != l.Name {
+				continue
+			}
+			// Reusing the credentials is what makes a re-run a *repair*. A
+			// fresh PSK for an existing line would silently invalidate every
+			// client already configured with the old one — and the deployment
+			// that did it would still report success. Only the transport's own
+			// settings are preserved: the listen address and the enabled flag
+			// come from this invocation, so moving a line to another port still
+			// works.
+			//
+			// A changed transport must regenerate them, because the settings
+			// are scheme-specific and a UUID means nothing to trojan.
+			if cfg.Server.Listeners[i].Transport == l.Transport {
+				if prev := cfg.Server.Listeners[i].Settings; len(prev) > 0 {
+					l.Settings = prev
+				}
+			}
+			cfg.Server.Listeners[i] = l
+			replaced = true
+			break
+		}
+		// A listener whose port is already claimed by a *different* line would
+		// fail to bind, and the failure would only appear in the relay's log.
+		// Catch it while the operator is still watching. The check runs whether
+		// the line was appended or replaced, because an update can move a line
+		// onto a port another line already owns.
+		for _, other := range cfg.Server.Listeners {
+			if other.Name != l.Name && other.Listen == l.Listen {
+				return fmt.Errorf("端口 %s 已被线路 %q 使用；请换一个 --listen 或 --port", l.Listen, other.Name)
+			}
+		}
+		if !replaced {
+			cfg.Server.Listeners = append(cfg.Server.Listeners, l)
+		}
+
+		// The credentials are derived from the listener rather than assembled
+		// alongside it, so this path and `show-credentials` cannot disagree
+		// about what a client needs. They used to: init printed a reality
+		// relay's public key and show-credentials did not, which made a relay
+		// installed by the one-click script impossible to add to a client.
+		creds = install.ListenerCredentials(l)
 
 		// A "both" configuration runs a relay and a client in one process, so
 		// the client is wired to the relay that was just generated. Without
 		// this the operator has to copy the credentials off the terminal into
 		// the console before the proxy does anything, and the console's relay
 		// list is empty on a configuration that plainly contains a relay.
+		//
+		// The local client entry is keyed by the listener name for the same
+		// reason: re-adding a line must update its client half rather than
+		// leaving a stale entry pointing at the credentials it just replaced.
 		if cfg.Client != nil {
-			cfg.Client.Servers = append(cfg.Client.Servers, config.ServerEntry{
-				ID:        "srv-local",
+			localID := "srv-local"
+			if l.Name != "" {
+				localID = "srv-local-" + l.Name
+			}
+			entry := config.ServerEntry{
+				ID:        localID,
 				Name:      l.Name + "（本机）",
 				Address:   clientAddressFor(listen),
 				Transport: transport,
 				Enabled:   true,
-				Settings:  clientSettingsFor(transport, creds),
-			})
+				Settings:  install.ClientSettingsFor(transport, creds),
+			}
+			found := false
+			for i := range cfg.Client.Servers {
+				if cfg.Client.Servers[i].ID == localID {
+					cfg.Client.Servers[i] = entry
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg.Client.Servers = append(cfg.Client.Servers, entry)
+			}
 		}
 	}
 
@@ -366,16 +483,23 @@ func cmdInit(args []string) error {
 	fmt.Printf("运行模式：%s\n", cfg.Mode)
 	fmt.Printf("网页控制台：http://%s\n", cfg.WebUI.Listen)
 	fmt.Printf("管理员用户名：%s\n", cfg.WebUI.Username)
-	fmt.Printf("管理员密码：%s\n", adminPass)
+	fmt.Printf("管理员密码：%s\n", adminPassReport)
+	if cfg.Server != nil {
+		fmt.Printf("中转线路：%d 条\n", len(cfg.Server.Listeners))
+	}
 	fmt.Println()
-	fmt.Println("请妥善保存以上密码；配置文件中只保存了密码的哈希值，无法找回。")
+	if adminPassReport == "未更改（沿用现有配置）" {
+		fmt.Println("管理员密码未被修改。")
+	} else {
+		fmt.Println("请妥善保存以上密码；配置文件中只保存了密码的哈希值，无法找回。")
+	}
 
 	if cfg.Server != nil {
 		fmt.Println()
 		fmt.Println("中转服务端凭据（客户端连接时需要）：")
-		for _, k := range []string{"transport", "listen", "name", "psk", "uuid", "password", "method", "publicKey", "shortId", "serverName", "username"} {
-			if v, ok := creds[k]; ok && v != "" {
-				fmt.Printf("%s=%s\n", k, v)
+		for _, key := range install.CredentialKeyOrder {
+			if v, ok := creds[key]; ok && v != "" {
+				fmt.Printf("%s=%s\n", key, v)
 			}
 		}
 	}
@@ -501,49 +625,14 @@ func clientAddressFor(listen string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// clientSettingsFor derives the client half of a relay's credentials.
+// clientSettingsFor is kept as a thin alias so the tests that pin the client
+// translation keep asserting against the one implementation that ships.
 //
-// It is a translation rather than a copy: the relay's settings contain its
-// private key material (certFile, keyFile, privateKey) which must never reach
-// the client, and the client needs fields the relay does not have, such as
-// "insecure" for a self-signed certificate.
+// The real work lives in install.ClientSettingsFor, which the console's deploy
+// path also uses. Two copies of this logic is what previously let a deployed
+// relay land in a client without the "insecure"/"tls" fields it needs.
 func clientSettingsFor(transportName string, creds map[string]string) map[string]any {
-	s := map[string]any{}
-	if psk := creds["psk"]; psk != "" {
-		s["psk"] = psk
-	}
-
-	switch transportName {
-	case "tls", "vless", "vmess", "trojan":
-		// The relay's certificate is self-signed and freshly generated, so the
-		// client cannot verify it against a CA. It still authenticates the
-		// relay through the preamble's PSK, which is what actually protects
-		// the link. No serverName is set, so the transport uses the dial host.
-		s["insecure"] = true
-		switch transportName {
-		case "vless", "vmess":
-			s["uuid"] = creds["uuid"]
-		case "trojan":
-			s["password"] = creds["password"]
-		}
-	case "shadowsocks":
-		s["method"] = creds["method"]
-		s["password"] = creds["password"]
-	case "reality":
-		// REALITY is the one scheme whose security depends on the name and the
-		// key, so all three fields are mandatory rather than cosmetic.
-		s["serverName"] = creds["serverName"]
-		s["publicKey"] = creds["publicKey"]
-		s["shortId"] = creds["shortId"]
-	case "socks5":
-		s["username"] = creds["username"]
-		s["password"] = creds["password"]
-	case "ws", "httpupgrade":
-		// These schemes are plain by default on the relay, so the client must
-		// not attempt a TLS handshake the relay is not expecting.
-		s["tls"] = false
-	}
-	return s
+	return install.ClientSettingsFor(transportName, creds)
 }
 
 // logxUnused keeps the logx import honest if a future edit removes its only

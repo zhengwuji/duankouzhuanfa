@@ -611,6 +611,17 @@ async function deleteTunnel(t) {
 async function renderHealth(host) {
   const data = await api('/api/v1/health');
   state.health = data.servers || [];
+  // The probe counters live in the client stats, not in the per-server health
+  // rows, so they are fetched separately. They are the only evidence that the
+  // periodic checker is actually running: without them an operator staring at
+  // "last check" times cannot tell a scheduled probe from a manual one.
+  let stats = {};
+  try {
+    const status = await api('/api/v1/status');
+    stats = ((status.client || {}).stats) || {};
+  } catch (err) {
+    stats = {};
+  }
   clear(host);
 
   if (!state.health.length) {
@@ -651,6 +662,11 @@ async function renderHealth(host) {
         ])]),
         el('tbody', {}, rows),
       ]),
+    ]),
+    el('div', { class: 'grid cols-3' }, [
+      stat('累计探测', num(stats.healthChecks), '次'),
+      stat('探测失败', num(stats.healthFailures), '次'),
+      stat('线路总数', num(state.health.length), '条'),
     ]),
   ]));
 }

@@ -394,6 +394,101 @@ func TestPayloadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestStreamOutlivesTheHandshakeTimeout pins a regression that silently
+// truncated every TLS-tunnelled transfer slower than the handshake timeout.
+//
+// The handler bounds tls.Server's handshake with a full SetDeadline. Every
+// other transport cleared that deadline before handing the connection to the
+// preamble helper; this one did not, so the *write* deadline stayed armed and
+// the relay's copy loop hit i/o timeout on the first write after it expired —
+// reported to the client as an unexplained EOF, with nothing logged on the
+// relay. A 60 KB transfer through an 8 KB/s account (≈12.8 s, past the 10 s
+// default) is exactly the shape that exposed it in the field.
+//
+// The relay here uses a deliberately tiny handshake timeout so the test stays
+// fast while still outliving it.
+func TestStreamOutlivesTheHandshakeTimeout(t *testing.T) {
+	certPath, keyPath, _ := generatedCert(t)
+
+	const shortTimeout = 400 * time.Millisecond
+	serverSettings := transport.Settings{
+		SettingCertFile: certPath,
+		SettingKeyFile:  keyPath,
+		SettingPSK:      testPSK,
+		SettingTimeout:  shortTimeout,
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	type result struct {
+		stream transport.Stream
+		err    error
+	}
+	results := make(chan result, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		st, err := Handler{}.Handle(context.Background(), conn, transport.HandleRequest{
+			Timeout:  shortTimeout,
+			Settings: serverSettings,
+		})
+		results <- result{st, err}
+	}()
+
+	stream, err := (Dialer{}).Dial(context.Background(), transport.DialRequest{
+		ServerAddr: ln.Addr().String(),
+		Request: &transport.Request{
+			Command: transport.CmdConnectTCP,
+			Target:  "93.184.216.34:443",
+		},
+		Timeout: 5 * time.Second,
+		Settings: transport.Settings{
+			SettingPSK:                testPSK,
+			SettingInsecureSkipVerify: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+
+	var srv transport.Stream
+	select {
+	case r := <-results:
+		if r.err != nil {
+			t.Fatalf("the relay refused the handshake: %v", r.err)
+		}
+		srv = r.stream
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay never finished the handshake")
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	// Sit idle past the handshake deadline. A stream that still carries bytes
+	// here is the whole point: the deadline must have been cleared once the
+	// handshake completed.
+	time.Sleep(shortTimeout + 300*time.Millisecond)
+
+	// Relay to client first, since that is the direction the stale write
+	// deadline used to kill.
+	writeAsync(srv, []byte("relay-to-client-late"))
+	if got := readN(t, stream, len("relay-to-client-late")); string(got) != "relay-to-client-late" {
+		t.Fatalf("the client read %q after the handshake timeout elapsed, want \"relay-to-client-late\"", got)
+	}
+
+	// The client-to-relay direction must survive too.
+	writeAsync(stream, []byte("client-to-relay-late"))
+	if got := readN(t, srv, len("client-to-relay-late")); string(got) != "client-to-relay-late" {
+		t.Fatalf("the relay read %q after the handshake timeout elapsed, want \"client-to-relay-late\"", got)
+	}
+}
+
 // TestPSKMatrix proves the preamble MAC still authenticates inside the tunnel.
 // TLS protects the hop, but the PSK is what stops an unrelated client that can
 // reach the port from asking the relay to forward on its behalf.

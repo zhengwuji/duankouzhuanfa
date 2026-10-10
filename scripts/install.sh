@@ -259,6 +259,12 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 ReadWritePaths=${DATA_DIR} ${LOG_DIR} ${CONFIG_DIR}
+# systemd sets no HOME, and the console's remote-deployment feature stores the
+# SSH host keys it trusts under $HOME/.ssh/known_hosts. Without this the store
+# has no writable home to live in, and the service runs with a working directory
+# of "/" under ProtectSystem=strict. The data directory is already writable and
+# is the right place for a daemon's own state, so it doubles as the home.
+Environment=HOME=${DATA_DIR}
 StandardOutput=append:${LOG_DIR}/porttransit.log
 StandardError=append:${LOG_DIR}/porttransit.log
 
@@ -456,7 +462,8 @@ PortTransit 一键脚本
 安装选项：
   --transport <名称>   中转协议，默认 tls
                        可选：tls / reality / vless / vmess / trojan /
-                             shadowsocks / websocket / httpupgrade / direct
+                             shadowsocks / ws（WebSocket）/ httpupgrade /
+                             http（HTTP CONNECT）/ socks5 / direct
   --port <端口>        中转监听端口，默认 8443
   --listen <地址>      完整监听地址，例如 0.0.0.0:443（优先于 --port）
   --name <名称>        线路名称，例如「上海中转」

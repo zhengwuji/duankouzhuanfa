@@ -43,20 +43,23 @@ func NewStats() *Stats { return &Stats{startedAt: time.Now()} }
 
 // Snapshot is the JSON view of the counters.
 type Snapshot struct {
-	ActiveConnections int64   `json:"activeConnections"`
-	TotalConnections  int64   `json:"totalConnections"`
-	ActiveForwards    int64   `json:"activeForwards"`
-	HandshakeFailures int64   `json:"handshakeFailures"`
-	RejectedThrottled int64   `json:"rejectedThrottled"`
-	RejectedLimit     int64   `json:"rejectedLimit"`
-	ACLDenied         int64   `json:"aclDenied"`
-	DialFailures      int64   `json:"dialFailures"`
-	Pings             int64   `json:"pings"`
-	Fallbacks         int64   `json:"fallbacks"`
-	BytesUp           int64   `json:"bytesUp"`
-	BytesDown         int64   `json:"bytesDown"`
-	AvgDialMs         float64 `json:"avgDialMs"`
-	UptimeSeconds     int64   `json:"uptimeSeconds"`
+	ActiveConnections int64 `json:"activeConnections"`
+	TotalConnections  int64 `json:"totalConnections"`
+	ActiveForwards    int64 `json:"activeForwards"`
+	HandshakeFailures int64 `json:"handshakeFailures"`
+	RejectedThrottled int64 `json:"rejectedThrottled"`
+	RejectedLimit     int64 `json:"rejectedLimit"`
+	ACLDenied         int64 `json:"aclDenied"`
+	DialFailures      int64 `json:"dialFailures"`
+	Pings             int64 `json:"pings"`
+	Fallbacks         int64 `json:"fallbacks"`
+	BytesUp           int64 `json:"bytesUp"`
+	BytesDown         int64 `json:"bytesDown"`
+	// DialCount is the divisor behind AvgDialMs. It is reported so an operator
+	// can tell "no dials yet" (both zero) from a genuinely zero average.
+	DialCount     int64   `json:"dialCount"`
+	AvgDialMs     float64 `json:"avgDialMs"`
+	UptimeSeconds int64   `json:"uptimeSeconds"`
 }
 
 // Snapshot reads every counter consistently enough for display.
@@ -79,6 +82,7 @@ func (s *Stats) Snapshot() Snapshot {
 		Fallbacks:         s.Fallbacks.Load(),
 		BytesUp:           s.BytesUp.Load(),
 		BytesDown:         s.BytesDown.Load(),
+		DialCount:         dials,
 		AvgDialMs:         avg,
 		UptimeSeconds:     int64(time.Since(s.startedAt).Seconds()),
 	}
@@ -363,14 +367,23 @@ func (r *rateLimiter) wait(n int) {
 		return
 	}
 	remaining := float64(n)
+	// first distinguishes arriving at an idle bucket from resuming a wait.
+	// Only the idle case is clamped to the capacity: the clamp exists to stop
+	// an unused bucket from banking an unbounded burst, but applying it to a
+	// refill earned *while the caller was blocked* throws away tokens the
+	// caller already waited for. A block larger than the capacity would then
+	// make only capacity bytes of progress per second and be throttled to a
+	// quarter of the configured rate.
+	first := true
 	for remaining > 0 {
 		r.mu.Lock()
 		now := time.Now()
 		r.tokens += now.Sub(r.last).Seconds() * r.rate
-		if r.tokens > r.capacity {
+		if first && r.tokens > r.capacity {
 			r.tokens = r.capacity
 		}
 		r.last = now
+		first = false
 
 		if r.tokens >= remaining {
 			r.tokens -= remaining

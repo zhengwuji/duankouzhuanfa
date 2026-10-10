@@ -436,6 +436,43 @@ func TestRateLimiterAllowsBurst(t *testing.T) {
 	nilLimiter.wait(1 << 20)
 }
 
+// TestRateLimiterSustainsTheConfiguredRate proves a block larger than the
+// bucket capacity is still delivered at the configured rate.
+//
+// The limiter clamps the bucket to a quarter-second of credit so an idle
+// bucket cannot bank an unbounded burst. Applying that clamp to the refill
+// earned *while the caller was already blocked* discarded the tokens it had
+// waited for, so a write larger than the capacity advanced by only capacity
+// bytes per second — a quarter of the configured rate. With the relay's 32 KiB
+// copy buffer and a typical 8 KB/s account that turned a 14.6 s transfer into
+// 57 s.
+func TestRateLimiterSustainsTheConfiguredRate(t *testing.T) {
+	const kbps = 8
+	const chunk = 32768 // the relay's default copy buffer
+	const total = 120000
+
+	r := newRateLimiter(kbps)
+	if r == nil {
+		t.Fatal("newRateLimiter returned nil for a positive rate")
+	}
+
+	start := time.Now()
+	for sent := 0; sent < total; sent += chunk {
+		r.wait(chunk)
+	}
+	elapsed := time.Since(start)
+
+	ideal := time.Duration(float64(total) / (float64(kbps) * 1024) * float64(time.Second))
+	// Generous upper bound: the point is to catch a 4x throttle, not to pin
+	// scheduler noise. Anything under 1.6x of ideal means the bucket is not
+	// throwing away the credit earned during a wait.
+	if limit := ideal * 16 / 10; elapsed > limit {
+		t.Errorf("throttling %d bytes in %d-byte blocks at %d KB/s took %v, want about %v "+
+			"(the refill earned while blocked is being clamped to the bucket capacity)",
+			total, chunk, kbps, elapsed.Round(time.Millisecond), ideal.Round(time.Millisecond))
+	}
+}
+
 // TestIsBenignNetErr proves ordinary shutdown errors are not logged as faults,
 // so a relay's log stays readable.
 func TestIsBenignNetErr(t *testing.T) {

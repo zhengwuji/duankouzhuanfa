@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"porttransit/internal/config"
+	"porttransit/internal/install"
 	"porttransit/internal/sshdeploy"
 )
 
@@ -149,19 +150,37 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if res.OK && res.Address != "" && s.cfg.Client != nil {
 		addToClient := body.AddToClient == nil || *body.AddToClient
 		if addToClient {
+			// The settings go through the same translation every other path
+			// uses. Copying the relay's reported credentials straight in looks
+			// equivalent but is not: a client entry also needs the fields the
+			// relay does not have — "insecure" for the self-signed certificate
+			// the relay just generated, and "tls": false for the schemes it
+			// serves in the clear. Without them the deployment reports success
+			// and every connection through it fails on this machine.
 			entry := config.ServerEntry{
 				ID:         newID("srv"),
-				Name:       firstNonEmpty(body.Name, res.Address),
+				Name:       firstNonEmpty(body.Name, res.Name, res.Address),
 				Address:    res.Address,
 				Transport:  res.Transport,
 				Enabled:    true,
-				Settings:   map[string]any{},
+				Settings:   install.ClientSettingsFor(res.Transport, res.Settings),
 				LatencyTag: body.Host,
 			}
-			for k, v := range res.Settings {
-				entry.Settings[k] = v
-			}
 			if err := s.mutate(func(cfg *config.Config) error {
+				// Redeploying to the same endpoint updates the existing entry
+				// instead of adding a second one. The relay regenerates its
+				// credentials on every deployment, so the older duplicate would
+				// keep pointing at a key that no longer authenticates — and
+				// because it still looks well-formed, the client would spend
+				// its attempts on it and fail.
+				for i := range cfg.Client.Servers {
+					if cfg.Client.Servers[i].Address == entry.Address &&
+						cfg.Client.Servers[i].Transport == entry.Transport {
+						entry.ID = cfg.Client.Servers[i].ID
+						cfg.Client.Servers[i] = entry
+						return nil
+					}
+				}
 				cfg.Client.Servers = append(cfg.Client.Servers, entry)
 				return nil
 			}); err != nil {

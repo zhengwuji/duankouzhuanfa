@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"porttransit/internal/config"
+	"porttransit/internal/transports/reality"
 )
 
 // Paths the installer owns.
@@ -219,6 +220,12 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 ReadWritePaths=` + DataDir + ` ` + LogDir + ` ` + ConfigDir + `
+# systemd sets no HOME, and the console's remote-deployment feature stores the
+# SSH host keys it trusts under $HOME/.ssh/known_hosts. Without this the store
+# has no writable home to live in, and the service runs with a working directory
+# of "/" under ProtectSystem=strict. The data directory is already writable and
+# is the right place for a daemon's own state, so it doubles as the home.
+Environment=HOME=` + DataDir + `
 StandardOutput=append:` + LogDir + `/porttransit.log
 StandardError=append:` + LogDir + `/porttransit.log
 
@@ -391,9 +398,11 @@ func ShowCredentials(args []string) error {
 	fs := flag.NewFlagSet("show-credentials", flag.ContinueOnError)
 	var (
 		path   string
+		name   string
 		asJSON bool
 	)
 	fs.StringVar(&path, "config", ConfigPath, "配置文件路径")
+	fs.StringVar(&name, "name", "", "只输出该名称的中转监听（默认第一条已启用的）")
 	fs.BoolVar(&asJSON, "json", false, "以 JSON 输出（保留兼容；默认输出 key=value）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -414,19 +423,179 @@ func ShowCredentials(args []string) error {
 		if !l.Enabled {
 			continue
 		}
-		fmt.Printf("transport=%s\n", l.Transport)
-		fmt.Printf("listen=%s\n", l.Listen)
-		fmt.Printf("name=%s\n", l.Name)
-		for _, key := range []string{"psk", "uuid", "password", "method", "publicKey", "shortId", "serverName", "username", "network", "path", "flow", "fingerprint"} {
-			if v, ok := l.Settings[key]; ok {
+		// A named lookup has to be able to find a listener that is not the
+		// first one. Without this the deployment path, which reads the
+		// credentials back after adding a line, would report the credentials
+		// of whichever relay happened to be configured first — and wire the
+		// client to an endpoint the operator never asked for.
+		if name != "" && l.Name != name {
+			continue
+		}
+		creds := ListenerCredentials(l)
+		// A stable order so the output can be diffed between runs.
+		for _, key := range CredentialKeyOrder {
+			if v, ok := creds[key]; ok && v != "" {
 				fmt.Printf("%s=%v\n", key, v)
 			}
 		}
-		// Only the first enabled listener is reported: a client entry names one
-		// endpoint, and an operator adding a second one can read the config.
+		// Without a name only the first enabled listener is reported: a client
+		// entry names one endpoint, and an operator adding a second one can
+		// read the config.
 		return nil
 	}
+	if name != "" {
+		return fmt.Errorf("show-credentials: 没有名为 %q 的已启用中转监听", name)
+	}
 	return errors.New("show-credentials: 没有已启用的中转监听")
+}
+
+// CredentialKeyOrder fixes the order credentials are printed in, so the output
+// can be diffed between runs and read by eye.
+var CredentialKeyOrder = []string{
+	"transport", "listen", "name",
+	"psk", "uuid", "password", "method",
+	"publicKey", "shortId", "serverName",
+	"username", "network", "path", "flow", "fingerprint",
+}
+
+// ClientSettingsFor derives the client half of a relay's credentials.
+//
+// It is a translation rather than a copy, and it is shared by every path that
+// wires a client to a relay — `init --mode both`, the console's "deploy a
+// relay" button, and anything added later. That sharing is the point: the two
+// paths used to differ, and the difference was invisible until a connection
+// failed on the user's machine.
+//
+// Two things happen here, and both are needed:
+//
+//  1. Only client-relevant fields are carried over. The relay's settings hold
+//     its private key material (privateKey, certFile, keyFile), and copying
+//     them wholesale would write a relay's private key into the client half of
+//     a file the console displays. The allowlist is what makes that impossible
+//     rather than merely unlikely.
+//  2. Fields the relay does not have are added: "insecure" for a freshly
+//     generated self-signed certificate, and "tls": false for the schemes the
+//     relay serves in the clear. A client entry that records the address and
+//     key correctly but omits these fails every handshake, which is a
+//     configuration error that only shows up as a timeout.
+func ClientSettingsFor(transportName string, creds map[string]string) map[string]any {
+	s := map[string]any{}
+
+	// clientCredentialKeys are the fields a client authenticates or frames
+	// with. Anything not listed here is deliberately not carried over, because
+	// the same map holds the relay's private material.
+	for _, key := range []string{
+		"psk", "uuid", "password", "method",
+		"publicKey", "shortId", "serverName",
+		"username", "network", "path", "flow",
+		"fingerprint", "certFingerprint",
+	} {
+		if v := creds[key]; v != "" {
+			s[key] = v
+		}
+	}
+
+	switch transportName {
+	case "tls", "vless", "vmess", "trojan":
+		// The relay's certificate is self-signed and freshly generated, so the
+		// client cannot verify it against a CA. It still authenticates the
+		// relay through the preamble's PSK, which is what actually protects
+		// the link.
+		//
+		// A pinned fingerprint (certFingerprint) would be strictly better than
+		// insecure, but it cannot be known here: the certificate does not exist
+		// until the relay's first handshake generates it. An operator who has
+		// that fingerprint can set it explicitly, and it takes precedence.
+		if s["certFingerprint"] == nil {
+			s["insecure"] = true
+		}
+	case "ws", "httpupgrade":
+		// These schemes are plain by default on the relay, so the client must
+		// not attempt a TLS handshake the relay is not expecting. Both default
+		// to TLS on the client side, so leaving this unset makes the client
+		// wait for a ServerHello that never comes.
+		s["tls"] = false
+	}
+	return s
+}
+
+// ListenerCredentials derives everything a client needs from one relay
+// listener, as a flat key/value map.
+//
+// It is exported and shared with the console's deploy path because the two used
+// to disagree: `init` printed a reality relay's public key while
+// `show-credentials` did not, so a relay installed by the one-click script
+// could not be added to a client afterwards — the key was printed once and then
+// unrecoverable. Deriving the public key from the stored private key is what
+// makes that recoverable, and putting the logic in one place is what stops the
+// two paths drifting again.
+func ListenerCredentials(l config.Listener) map[string]string {
+	creds := map[string]string{
+		"transport": l.Transport,
+		"listen":    l.Listen,
+		"name":      l.Name,
+	}
+
+	// Anything the transport itself calls a credential is passed through. The
+	// list is a filter rather than a copy because the settings also hold the
+	// relay's private key material.
+	for _, key := range []string{"psk", "uuid", "password", "method", "username", "network", "path", "flow", "fingerprint"} {
+		if v, ok := l.Settings[key]; ok {
+			creds[key] = fmt.Sprint(v)
+		}
+	}
+
+	if l.Transport == "reality" {
+		// The public key is not stored, so it is recomputed. A failure here is
+		// reported as an empty value rather than an error: the rest of the
+		// credentials are still valid, and refusing to print anything would
+		// hide a working relay behind one broken field.
+		if priv := stringSetting(l.Settings, "privateKey"); priv != "" {
+			if pub, err := reality.PublicKeyFromPrivate(priv); err == nil {
+				creds["publicKey"] = pub
+			}
+		}
+		if v, ok := l.Settings["shortId"]; ok {
+			creds["shortId"] = fmt.Sprint(v)
+		}
+		// serverNames is a list on the relay but a single name on the client.
+		if names := stringSliceSetting(l.Settings, "serverNames"); len(names) > 0 {
+			creds["serverName"] = names[0]
+		} else if v := stringSetting(l.Settings, "serverName"); v != "" {
+			creds["serverName"] = v
+		}
+	}
+	return creds
+}
+
+func stringSetting(s map[string]any, key string) string {
+	if s == nil {
+		return ""
+	}
+	v, ok := s[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
+}
+
+// stringSliceSetting reads a settings value that may be a []string or a
+// []any, which is what a JSON round-trip produces.
+func stringSliceSetting(s map[string]any, key string) []string {
+	if s == nil {
+		return nil
+	}
+	switch v := s[key].(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			out = append(out, fmt.Sprint(e))
+		}
+		return out
+	}
+	return nil
 }
 
 // DeployOptions parameterises a remote deployment.

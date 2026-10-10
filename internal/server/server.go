@@ -595,7 +595,11 @@ func (s *Server) serveTCP(h *listenerHandle, stream transport.Stream, target str
 		}
 	}
 
+	// Both counters must move together: Snapshot divides the accumulated
+	// latency by this count, so incrementing only the latency would leave the
+	// average reading as a permanent zero.
 	s.stats.DialLatencyMs.Add(time.Since(start).Milliseconds())
+	s.stats.DialCount.Add(1)
 	s.stats.ActiveForwards.Add(1)
 	defer s.stats.ActiveForwards.Add(-1)
 

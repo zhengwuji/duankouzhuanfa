@@ -145,10 +145,18 @@ func PreambleServerHandshake(conn net.Conn, cfg ServerHandshakeConfig) (Stream, 
 		return nil, errPingAnswered
 	}
 
-	// Clearing the deadline is best effort: the frame has already been read
-	// and verified, so a failure here (the peer having closed immediately
-	// after sending) must not discard a usable stream.
-	_ = conn.SetReadDeadline(time.Time{})
+	// Clear the whole deadline, not just the read half. Callers set a full
+	// deadline to bound their own handshake (see the TLS handler, which
+	// bounds tls.Server's handshake this way) and hand the connection over
+	// expecting a usable stream. Clearing only the read deadline leaves the
+	// write deadline armed, so the first write that lands after it expires —
+	// any transfer slower than the handshake timeout — fails with i/o
+	// timeout and silently truncates the stream.
+	//
+	// Clearing is best effort: the frame has already been read and verified,
+	// so a failure here (the peer having closed immediately after sending)
+	// must not discard a usable stream.
+	_ = conn.SetDeadline(time.Time{})
 
 	req := &Request{
 		Command:   pre.Command,

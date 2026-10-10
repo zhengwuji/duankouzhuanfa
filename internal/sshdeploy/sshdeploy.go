@@ -27,7 +27,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/user"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -97,6 +99,10 @@ type Result struct {
 	Port      int               `json:"port,omitempty"`
 	Settings  map[string]string `json:"settings,omitempty"`
 	ClientID  string            `json:"clientId,omitempty"`
+	// Name is the listener name that was created or updated on the relay. It
+	// is reported because a host may carry several lines and the operator
+	// needs to know which one this deployment touched.
+	Name string `json:"name,omitempty"`
 }
 
 // Remote paths the installer creates.
@@ -264,16 +270,59 @@ func Deploy(ctx context.Context, req Request) *Result {
 		return fail("安装的程序无法执行：%v\n这通常说明上传的二进制不是 linux/%s 构建。", err, info.Arch)
 	}
 
+	// Before touching the configuration, make sure the requested port is free.
+	//
+	// Every listener lives in one process, so a line that cannot bind does not
+	// fail alone — the whole relay fails to start and takes the lines that were
+	// already working down with it. A port held by porttransit itself is fine:
+	// the service is restarted below, which releases it. A port held by
+	// anything else is refused here, while the operator is still watching,
+	// rather than after the working lines have gone offline.
+	relayName := defaultName(req.Name, req.Host)
+	if out, err := runSudo(ctx, client, req.Username,
+		fmt.Sprintf("ss -lntp 2>/dev/null | grep ':%d ' || true", req.RelayPort)); err == nil {
+		if holder := strings.TrimSpace(out); holder != "" && !strings.Contains(holder, "porttransit") {
+			return fail("端口 %d 已被其它程序占用，无法添加线路：\n%s\n重启中转服务会让所有线路一起失败，因此没有改动配置", req.RelayPort, holder)
+		}
+	}
+
 	// Step 4: generate the relay configuration on the remote host, using the
 	// relay binary itself so the credential format is produced by the same
 	// code that will consume it.
+	//
+	// The listener is *appended*, not substituted. This step used to run
+	// `init --force`, which replaces the whole listener list, so deploying a
+	// second line to a host that already had one deleted the first — silently,
+	// while still reporting success. `--add-listener` adds the line and leaves
+	// every other listener, the account and the mode untouched, and re-running
+	// it against the same name updates that one line, so the step stays
+	// idempotent and still doubles as a repair.
+	//
+	// The previous configuration is kept until the new one is proven to start.
+	// A relay that already carried working lines must not be left with a config
+	// it cannot run: that turns a failed addition into an outage.
+	configBackup := remoteConfigPath + ".bak"
+	if _, err := runSudo(ctx, client, req.Username,
+		"if [ -f "+remoteConfigPath+" ]; then cp -f "+remoteConfigPath+" "+configBackup+"; fi"); err != nil {
+		emit("警告：无法备份现有配置：%v", err)
+	}
+	restoreConfig := func(reason string) {
+		if _, err := runSudo(ctx, client, req.Username,
+			"if [ -f "+configBackup+" ]; then cp -f "+configBackup+" "+remoteConfigPath+
+				" && systemctl restart porttransit && sleep 1; fi"); err != nil {
+			emit("警告：回滚配置失败，服务器上的 %s 可能无法启动：%v", remoteConfigPath, err)
+			return
+		}
+		emit("已回滚到部署前的配置并重启服务（%s）", reason)
+	}
+
 	emit("生成中转配置…")
 	if _, err := runSudo(ctx, client, req.Username, strings.Join([]string{
-		remoteBinPath + " init --mode server --force",
+		remoteBinPath + " init --mode server --add-listener",
 		"--config " + remoteConfigPath,
 		"--listen 0.0.0.0:" + strconv.Itoa(req.RelayPort),
 		"--transport " + shellQuote(req.Transport),
-		"--name " + shellQuote(defaultName(req.Name, req.Host)),
+		"--name " + shellQuote(relayName),
 		"--print-credentials",
 	}, " ")); err != nil {
 		return fail("生成配置失败：%v", err)
@@ -288,8 +337,9 @@ func Deploy(ctx context.Context, req Request) *Result {
 	}
 
 	// Read back the generated credentials so the client can add the relay
-	// immediately.
-	creds, err := readCredentials(ctx, client, req.Username)
+	// immediately. The name is passed so a host carrying several lines reports
+	// the one just added rather than whichever was configured first.
+	creds, err := readCredentials(ctx, client, req.Username, relayName)
 	if err != nil {
 		emit("警告：未能读取生成的凭据，请在服务器上手动查看 %s", remoteConfigPath)
 	}
@@ -297,32 +347,53 @@ func Deploy(ctx context.Context, req Request) *Result {
 	// Step 5: install the service unit.
 	emit("安装 systemd 服务…")
 	if err := installUnit(ctx, client, req.Username); err != nil {
+		restoreConfig("服务单元写入失败")
 		return fail("安装服务失败：%v", err)
 	}
 
+	// The unit is restarted rather than merely enabled. `systemctl enable --now`
+	// is a no-op for a unit that is already running, so on a host that already
+	// had a relay the process kept running with the configuration it read at
+	// startup — and the new listener was never bound, because nothing had
+	// asked the process to reload. `restart` is what makes the new line live.
 	emit("启动服务…")
 	if _, err := runSudo(ctx, client, req.Username,
-		"systemctl daemon-reload && systemctl enable --now porttransit && sleep 1 && systemctl is-active porttransit"); err != nil {
+		"systemctl daemon-reload && systemctl enable porttransit && systemctl restart porttransit && sleep 1 && systemctl is-active porttransit"); err != nil {
 		// A failed start is worth diagnosing rather than just reporting, so the
 		// unit's own log tail is fetched and shown.
 		if out, logErr := runSudo(ctx, client, req.Username, "journalctl -u porttransit -n 20 --no-pager"); logErr == nil {
 			emit("服务日志：\n%s", out)
 		}
+		restoreConfig("新配置无法启动")
 		return fail("服务启动失败：%v", err)
 	}
 	emit("服务已启动")
 
 	// Step 6: verify the relay is actually listening, and open the firewall if
 	// one is active.
+	//
+	// A relay that is not bound is a failed deployment, not a warning. It used
+	// to be reported as a warning while the deployment still printed success,
+	// so an operator whose port never opened was told everything was fine and
+	// only found out when a client could not connect.
 	emit("检查监听端口 %d…", req.RelayPort)
-	if out, err := runSudo(ctx, client, req.Username,
-		fmt.Sprintf("ss -lntp 2>/dev/null | grep -c ':%d ' || true", req.RelayPort)); err == nil {
-		if strings.TrimSpace(out) == "0" {
-			emit("警告：未检测到端口 %d 处于监听状态", req.RelayPort)
-		} else {
-			emit("端口 %d 正在监听", req.RelayPort)
-		}
+	out, err := runSudo(ctx, client, req.Username,
+		fmt.Sprintf("ss -lntp 2>/dev/null | grep -c ':%d ' || true", req.RelayPort))
+	if err != nil {
+		restoreConfig("无法确认端口状态")
+		return fail("无法检查监听端口 %d：%v", req.RelayPort, err)
 	}
+	if strings.TrimSpace(out) == "0" {
+		if tail, logErr := runSudo(ctx, client, req.Username, "journalctl -u porttransit -n 20 --no-pager"); logErr == nil {
+			emit("服务日志：\n%s", tail)
+		}
+		restoreConfig("新线路没有监听端口")
+		return fail("服务已启动但没有监听 %d：端口未绑定。常见原因是端口被占用或配置未生效，请查看上面的日志", req.RelayPort)
+	}
+	emit("端口 %d 正在监听", req.RelayPort)
+
+	// The deployment is proven, so the backup is no longer needed.
+	_, _ = runSudo(ctx, client, req.Username, "rm -f "+configBackup)
 
 	emit("检查防火墙…")
 	openFirewall(ctx, client, req.Username, req.RelayPort, emit)
@@ -330,6 +401,7 @@ func Deploy(ctx context.Context, req Request) *Result {
 	res.OK = true
 	res.Address = net.JoinHostPort(req.Host, strconv.Itoa(req.RelayPort))
 	res.Settings = creds
+	res.Name = relayName
 	res.Summary = fmt.Sprintf("%s 已安装 %s 中转服务端，监听 %s", req.Host, req.Transport, res.Address)
 	emit("完成：%s", res.Summary)
 	return res
@@ -373,8 +445,16 @@ func detectSystem(ctx context.Context, client *ssh.Client) (*systemInfo, error) 
 }
 
 // readCredentials pulls the generated relay settings back off the host.
-func readCredentials(ctx context.Context, client *ssh.Client, username string) (map[string]string, error) {
-	out, err := runSudo(ctx, client, username, remoteBinPath+" show-credentials --config "+remoteConfigPath+" --json")
+//
+// When name is non-empty only that listener is reported, which is what a
+// deployment needs: a host may carry several relays, and the one that was just
+// written is not necessarily the first in the file.
+func readCredentials(ctx context.Context, client *ssh.Client, username, name string) (map[string]string, error) {
+	cmd := remoteBinPath + " show-credentials --config " + remoteConfigPath + " --json"
+	if name != "" {
+		cmd += " --name " + shellQuote(name)
+	}
+	out, err := runSudo(ctx, client, username, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -419,6 +499,11 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=` + remoteDataDir + ` ` + remoteLogDir + ` ` + remoteConfigDir + `
+# systemd sets no HOME, and a relay host can also serve the console, whose
+# remote-deployment feature keeps the SSH host keys it trusts in
+# $HOME/.ssh/known_hosts. The data directory is writable and is where a daemon's
+# own state belongs, so it doubles as the home.
+Environment=HOME=` + remoteDataDir + `
 StandardOutput=append:` + remoteLogDir + `/porttransit.log
 StandardError=append:` + remoteLogDir + `/porttransit.log
 
@@ -560,8 +645,15 @@ func authMethods(req Request) ([]ssh.AuthMethod, error) {
 				methods = append(methods, ssh.PublicKeys(agentSigners...))
 			}
 		}
+		// An unknown home directory only means the standard key files cannot be
+		// tried; the agent above and an explicit key or password still work, so
+		// this is not worth failing the deployment over.
+		home, _ := homeDir()
 		for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
-			p := path.Join(homeDir(), ".ssh", name)
+			if home == "" {
+				break
+			}
+			p := path.Join(home, ".ssh", name)
 			pem, err := os.ReadFile(p)
 			if err != nil {
 				continue
@@ -596,29 +688,123 @@ func authMethods(req Request) ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
-// defaultHostKeyCallback verifies the host key against known_hosts.
+// hostKeyPath is the known_hosts file used to verify relay hosts. It is a
+// variable so tests can point it at a temporary file instead of the developer's
+// real known_hosts.
+//
+// It is a local filesystem path, so it is built with filepath: path.Join would
+// produce a mixed-separator name on Windows and filepath.Dir would then fail to
+// find the directory it is supposed to create.
+//
+// It returns an error rather than guessing when the home directory is unknown.
+// The console runs as a systemd service, and systemd does not set HOME: the
+// original fallback to "." resolved the path against the working directory, so
+// the store landed in a read-only "/" and the deployment died with the
+// unintelligible "cannot create .ssh: mkdir .ssh: read-only file system". Worse,
+// had the working directory been writable, a later run from a different
+// directory would have found no record and re-trusted the host, silently
+// defeating the pinning that makes trust-on-first-use safe.
+var hostKeyPath = func() (string, error) {
+	home, err := homeDir()
+	if err != nil {
+		return "", fmt.Errorf("%w; it is where the SSH host keys this console trusts are kept", err)
+	}
+	return filepath.Join(home, ".ssh", "known_hosts"), nil
+}
+
+// defaultHostKeyCallback verifies the remote host key against known_hosts.
+//
+// A host that is already recorded is verified strictly, and a key that has
+// *changed* is always refused: that is the case where somebody else has taken
+// over the address, and accepting it silently would hand them the server.
+//
+// A host that is not recorded yet is accepted and recorded — "trust on first
+// use", what OpenSSH spells accept-new — and its fingerprint is printed into
+// the deployment transcript. Refusing unknown hosts outright is stricter in
+// isolation but makes this feature unusable on exactly the machines it targets:
+// a fresh console host (a Windows desktop, a new server) has no known_hosts at
+// all, so every first deployment would fail and tell the operator to go run ssh
+// by hand, which is the manual step the one-click install exists to remove.
+// Printing the fingerprint keeps the trust decision visible rather than silent,
+// and because the key is recorded, the *next* deployment verifies it strictly.
 func defaultHostKeyCallback(emit func(string, ...any)) (ssh.HostKeyCallback, error) {
-	khPath := path.Join(homeDir(), ".ssh", "known_hosts")
+	khPath, err := hostKeyPath()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(khPath), 0o700); err != nil {
+		return nil, fmt.Errorf("cannot create %s: %w", filepath.Dir(khPath), err)
+	}
+	if _, err := os.Stat(khPath); err != nil {
+		// knownhosts.New refuses a missing file, and "no file" is not an error
+		// here: it means no host has been recorded yet, which is the normal
+		// state of a machine that has never run ssh.
+		f, err := os.OpenFile(khPath, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create %s: %w", khPath, err)
+		}
+		_ = f.Close()
+	}
 	cb, err := knownhosts.New(khPath)
 	if err != nil {
-		// Without a known_hosts file there is nothing to verify against, and
-		// silently accepting any key would make the deployment a credential
-		// handover to whoever answers on that address.
-		return nil, fmt.Errorf("cannot verify the server's SSH host key: %w (create %s by connecting once with ssh)", err, khPath)
+		return nil, fmt.Errorf("cannot read %s: %w", khPath, err)
 	}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		if err := cb(hostname, remote, key); err != nil {
-			return fmt.Errorf("the server's SSH host key is not trusted: %w", err)
+		err := cb(hostname, remote, key)
+		if err == nil {
+			return nil
 		}
-		return nil
+		var keyErr *knownhosts.KeyError
+		if errors.As(err, &keyErr) {
+			// Want is empty for a host that has no entry, and non-empty when
+			// the host is known but presented a different key.
+			if len(keyErr.Want) == 0 {
+				return trustHostKey(khPath, hostname, key, emit)
+			}
+			return fmt.Errorf("the server's SSH host key does not match the key recorded in %s; "+
+				"if the server was rebuilt, remove its line from that file: %w", khPath, err)
+		}
+		return fmt.Errorf("the server's SSH host key could not be verified: %w", err)
 	}, nil
 }
 
-func homeDir() string {
-	if h, err := os.UserHomeDir(); err == nil {
-		return h
+// trustHostKey records a host key seen for the first time and reports its
+// fingerprint so the operator can recognise the server they just trusted.
+func trustHostKey(khPath, hostname string, key ssh.PublicKey, emit func(string, ...any)) error {
+	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
+	f, err := os.OpenFile(khPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("cannot record the host key in %s: %w", khPath, err)
 	}
-	return "."
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("cannot record the host key in %s: %w", khPath, err)
+	}
+	emit("首次连接该服务器，已记录其 SSH 主机密钥：%s", ssh.FingerprintSHA256(key))
+	return nil
+}
+
+// homeDir is the resolver used by hostKeyPath. It is a variable so tests can
+// simulate the service environment, where HOME is unset and the answer cannot be
+// looked up.
+var homeDir = homeDirReal
+
+// homeDirReal returns the home directory of the account running this process.
+//
+// The HOME environment variable is tried first because it is what a shell would
+// use. It is not sufficient on its own: systemd does not set HOME for a service,
+// and os.UserHomeDir simply reports the variable as unset. The account database is
+// the fallback, which gives the right answer for the console's own service, and
+// it is consulted rather than guessed so a failure is reported instead of
+// producing a relative path that resolves against the working directory.
+func homeDirReal() (string, error) {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h, nil
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir, nil
+	}
+	return "", errors.New("cannot determine the home directory (HOME is not set and the user database has no entry)")
 }
 
 // run executes a command without sudo.
