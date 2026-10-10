@@ -3,11 +3,13 @@ package server
 import (
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
 
 	"porttransit/internal/config"
+	"porttransit/internal/logx"
 	"porttransit/internal/transport"
 )
 
@@ -387,6 +389,56 @@ func TestHandshakeGuardDisabled(t *testing.T) {
 	var nilGuard *handshakeGuard
 	if !nilGuard.allow("1.2.3.4") {
 		t.Error("a nil guard throttled an attempt")
+	}
+}
+
+// TestNoteHandshakeFailureWarnsOncePerWindow proves a failed handshake is
+// visible at the default log level without letting a flood fill the log.
+//
+// The failure this guards against is diagnosability, not correctness: every
+// handshake failure was logged only at Debug, so a relay whose clients could
+// not complete a handshake — a path being interfered with, a PSK rotated on one
+// side only — wrote nothing at all while its failure counter climbed. An
+// operator watching a broken line had no log evidence to look at.
+func TestNoteHandshakeFailureWarnsOncePerWindow(t *testing.T) {
+	buf := logx.NewBuffer(64)
+	log, err := logx.New(logx.Options{Level: slog.LevelInfo, Buffer: buf})
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	defer log.Close()
+
+	s := &Server{log: log}
+	h := &listenerHandle{cfg: config.Listener{Name: "relay-test", Transport: "tls"}}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	// The first failure must warn immediately: waiting out an interval would
+	// hide the very first sign of trouble.
+	if n := s.noteHandshakeFailure(h, server, errors.New("boom")); n != 1 {
+		t.Errorf("first failure reported %d folded failures, want 1", n)
+	}
+	// Further failures inside the window must be counted, not logged.
+	for i := 0; i < 5; i++ {
+		if n := s.noteHandshakeFailure(h, server, errors.New("boom")); n != 0 {
+			t.Errorf("failure %d inside the window was logged (folded=%d), want it suppressed", i+2, n)
+		}
+	}
+	warnings := 0
+	for _, e := range buf.Snapshot(0) {
+		if e.Level == "warn" && e.Message == "handshake failed" {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Errorf("emitted %d handshake-failure warnings for 6 failures, want exactly 1", warnings)
+	}
+	// The suppressed failures must not be lost: once the window elapses the
+	// next warning reports how many were folded in.
+	h.failLog.Store(time.Now().Add(-2 * handshakeFailureWarnInterval).UnixNano())
+	if n := s.noteHandshakeFailure(h, server, errors.New("boom")); n != 6 {
+		t.Errorf("warning after the window reported %d folded failures, want 6", n)
 	}
 }
 

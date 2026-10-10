@@ -87,6 +87,12 @@ type listenerHandle struct {
 	// err records why a listener is not serving, so the console can report it
 	// rather than showing a port that silently accepts nothing.
 	err error
+	// failLog holds the unix-nano time of the last rate-limited handshake
+	// failure warning for this listener, and failCount the number of failures
+	// seen since that warning. Together they turn a per-connection Debug line
+	// into an occasional Warn that a default-level operator can actually see.
+	failLog   atomic.Int64
+	failCount atomic.Int64
 }
 
 // New builds a relay from configuration.
@@ -402,12 +408,20 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 			return
 		}
 		s.stats.HandshakeFailures.Add(1)
+		// Logged at Debug per connection because a scanner or a flood would
+		// otherwise fill the log. The rate-limited Warn below is what makes the
+		// failure visible at the default level: without it a relay whose
+		// clients cannot complete a handshake — a path being interfered with, a
+		// wrong PSK after a rotation — logged nothing at all while its failure
+		// counter climbed, and the only symptom an operator had was a client
+		// that could not connect.
 		s.log.Debug("handshake failed",
 			"listener", h.cfg.Name,
 			"transport", h.cfg.Transport,
 			"remote", transport.RemoteAddrString(conn),
 			"err", err,
 		)
+		s.noteHandshakeFailure(h, conn, err)
 		return
 	}
 	defer stream.Close()
@@ -428,6 +442,40 @@ func (s *Server) serve(h *listenerHandle, conn net.Conn) {
 	}
 
 	s.serveRequest(h, stream, req)
+}
+
+// handshakeFailureWarnInterval is how often at most one handshake-failure
+// warning is emitted per listener. Long enough that a flood cannot fill the
+// log, short enough that an operator watching a broken line sees it promptly.
+const handshakeFailureWarnInterval = 30 * time.Second
+
+// noteHandshakeFailure emits an occasional Warn summarising handshake failures
+// on one listener, and returns the number of failures folded into that warning.
+//
+// The first failure on a listener always warns, because a relay that has never
+// served a successful handshake and is now refusing them is the case an
+// operator most needs to see, and waiting out an interval would hide it.
+func (s *Server) noteHandshakeFailure(h *listenerHandle, conn net.Conn, err error) int64 {
+	now := time.Now()
+	prev := h.failLog.Load()
+	if prev != 0 && now.UnixNano()-prev < int64(handshakeFailureWarnInterval) {
+		h.failCount.Add(1)
+		return 0
+	}
+	if !h.failLog.CompareAndSwap(prev, now.UnixNano()) {
+		// Another goroutine warned concurrently; let it own this window.
+		h.failCount.Add(1)
+		return 0
+	}
+	folded := h.failCount.Swap(0) + 1
+	s.log.Warn("handshake failed",
+		"listener", h.cfg.Name,
+		"transport", h.cfg.Transport,
+		"remote", transport.RemoteAddrString(conn),
+		"failures", folded,
+		"err", err,
+	)
+	return folded
 }
 
 // serveRequest handles one already-decoded request: admission, policy, and the
