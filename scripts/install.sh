@@ -377,6 +377,10 @@ show_result() {
   # 先给控制台入口：这是安装完最想立刻打开的东西。地址由二进制的
   # show-console 算出来（通配绑定会换成主机自己的出口地址），因为
   # "http://0.0.0.0:8787" 不是一个能打开的地址。
+  #
+  # `|| true` 是必要的：脚本开了 pipefail，show-console 是较新版本才有的
+  # 子命令，老二进制会让管道非零并触发 ERR trap。横幅显示不出地址可以接受，
+  # 因此中断整个安装不行。
   local console_url="" console_user="" console_listen=""
   local line
   while IFS= read -r line; do
@@ -386,6 +390,18 @@ show_result() {
       listen=*)   console_listen="${line#listen=}" ;;
     esac
   done < <("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null || true)
+
+  # 旧版二进制没有 show-console。退回直接读配置，这样横幅至少能给出监听地址
+  # 和账号（用户名来自配置，不依赖二进制），而不是干脆不显示控制台。
+  if [[ -z "${console_listen}" ]]; then
+    console_listen="$(config_webui_listen)"
+  fi
+  if [[ -z "${console_user}" ]]; then
+    console_user="$(config_webui_field "username")"
+  fi
+  if [[ -z "${console_url}" && -n "${console_listen}" ]]; then
+    console_url="http://${console_listen}"
+  fi
 
   if [[ -n "${console_url}" ]]; then
     printf '  %s网页控制台%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${console_url}" "${RESET}" >&2
@@ -428,6 +444,14 @@ show_result() {
     printf '  %s彻底卸载%s  %s uninstall --yes\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
     printf '              或用脚本卸载：curl -fsSL %s | bash -s -- --uninstall\n' "${SCRIPT_URL}" >&2
   fi
+  # 提示菜单的存在：用户的习惯是重跑那条带参数的安装命令，而带参数时不进
+  # 菜单（否则自动化脚本会被卡住），所以必须主动告诉他们怎么打开。
+  if [[ -n "${SCRIPT_PATH}" ]]; then
+    printf '  %s管理菜单%s  bash %s --menu\n' "${BOLD}" "${RESET}" "${SCRIPT_PATH}" >&2
+  else
+    printf '  %s管理菜单%s  curl -fsSL %s | bash -s -- --menu\n' \
+      "${BOLD}" "${RESET}" "${SCRIPT_URL}" >&2
+  fi
   echo >&2
 
   if [[ "${CONFIG_GENERATED}" -eq 1 ]]; then
@@ -459,9 +483,13 @@ do_install() {
 
   # 控制台绑定在非回环地址时也要放行，否则装完打印的公网链接根本连不上，
   # 用户会以为是控制台坏了。端口从 show-console 读，避免与配置漂移。
+  #
+  # `|| true` 不是可有可无的：脚本开了 pipefail，而 show-console 是较新版本
+  # 才有的子命令 —— 老版本二进制（或任何查询失败）会让整条管道非零，触发
+  # ERR trap 直接中断安装。查不到就不放行控制台端口，不该让安装失败。
   local webui_listen webui_port
   webui_listen="$("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null \
-    | sed -n 's/^listen=//p' | head -n1)"
+    | sed -n 's/^listen=//p' | head -n1 || true)"
   if [[ -n "${webui_listen}" && "${webui_listen}" != 127.0.0.1:* \
      && "${webui_listen}" != localhost:* && "${webui_listen}" != "[::1]:"* ]]; then
     webui_port="${webui_listen##*:}"
@@ -488,13 +516,16 @@ do_uninstall() {
       echo "    删除 ${CONFIG_DIR} ${DATA_DIR} ${LOG_DIR}（含全部配置与数据）" >&2
     fi
     echo >&2
-    if [[ ! -t 0 ]]; then
+    # 必须问终端，不能问 stdin。
+    #
+    # 文档里的主要用法是 `curl … | bash`，那时 stdin 就是脚本自身：从 stdin
+    # 读会把后面的脚本内容当成回答（而且无论答什么都可能正好是 "yes"），
+    # 卸载确认就形同虚设。菜单路径下更糟 —— 它会把脚本剩余部分吃掉，
+    # 菜单直接死掉。
+    if [[ ! -r /dev/tty ]]; then
       die "非交互环境下请显式加 --yes 确认卸载"
     fi
-    printf '确认继续？输入 yes 回车：' >&2
-    local answer=""
-    read -r answer || true
-    if [[ "${answer}" != "yes" ]]; then
+    if ! confirm "确认继续？"; then
       die "已取消"
     fi
   fi
@@ -573,6 +604,211 @@ do_status() {
   systemctl status "${BIN_NAME}" --no-pager 2>/dev/null || warn "服务未运行"
 }
 
+# ------------------------------------------------------------------ 交互菜单
+
+# 能否向用户提问。
+#
+# `curl … | bash` 是本脚本文档里的主要用法，那时 **stdin 是脚本自身**：任何
+# `read` 都会吃掉脚本后面的内容，而不是读用户的键盘。所以提问一律走 /dev/tty。
+# 没有终端时（CI、cron、Ansible、重定向）不进菜单，直接按参数执行。
+has_terminal() {
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  # 管道运行时 stdout/stderr 仍然连着终端，这是区分「有人在看」的依据。
+  [[ -t 1 || -t 2 ]] || return 1
+  return 0
+}
+
+# read_line <提示语>：从终端读一行并回显在 stdout。
+read_line() {
+  local prompt="$1" answer=""
+  printf '%s' "${prompt}" >&2
+  read -r answer < /dev/tty || answer=""
+  printf '%s' "${answer}"
+}
+
+# read_secret <提示语>：不回显地读一行（密码用）。
+read_secret() {
+  local prompt="$1" answer=""
+  printf '%s' "${prompt}" >&2
+  read -rs answer < /dev/tty || answer=""
+  printf '\n' >&2
+  printf '%s' "${answer}"
+}
+
+# confirm <问题>：只有输入 yes 才返回真。
+confirm() {
+  local answer
+  answer="$(read_line "$1（输入 yes 确认）：")"
+  [[ "${answer}" == "yes" ]]
+}
+
+# config_webui_field <字段名>：不依赖二进制、直接从配置里读控制台信息。
+#
+# show-console 是较新版本才有的子命令。装了旧版二进制的机器上，菜单仍要能
+# 说出控制台在哪个地址，否则会显示成「未启用」—— 那是错的，会让人以为控制台
+# 被关掉了。
+#
+# 配置是格式化过的 JSON，"webui" 与 "listen" 不在同一行，所以不能用单行 sed
+# 正则跨行匹配。这里先截出 webui 那一段再取字段。不用 python3：精简镜像上
+# 未必有，而安装脚本不该因此多一个依赖。
+config_webui_field() {
+  local field="$1"
+  sed -n '/"webui"[[:space:]]*:/,/^[[:space:]]*}/p' "${CONFIG_PATH}" 2>/dev/null \
+    | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+    | head -n1 || true
+}
+
+config_webui_listen() {
+  config_webui_field "listen"
+}
+
+# menu_summary 打印当前状态，让用户在选之前知道自己面对的是什么。
+menu_summary() {
+  local version service enabled lines console_url
+
+  version="$("${BIN_PATH}" version 2>/dev/null | head -n1 || true)"
+  [[ -n "${version}" ]] || version="未安装"
+
+  service="$(systemctl is-active "${BIN_NAME}" 2>/dev/null || true)"
+  enabled="$(systemctl is-enabled "${BIN_NAME}" 2>/dev/null || true)"
+  [[ -n "${service}" ]] || service="未运行"
+  [[ -n "${enabled}" ]] || enabled="未启用"
+
+  # grep -c 在匹配数为 0 时既打印 "0" 又返回非零，所以不能写成 `|| echo 0`：
+  # 那样会得到两行 "0"，打印出来是个换行。用管道接 awk 取第一个数字。
+  lines="$(grep -c '"transport"' "${CONFIG_PATH}" 2>/dev/null | head -n1 || true)"
+  [[ -n "${lines}" ]] || lines=0
+
+  console_url="$("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null \
+    | sed -n 's/^url=//p' | head -n1 || true)"
+  if [[ -z "${console_url}" ]]; then
+    # 旧版二进制没有 show-console，退回到直接读配置。
+    local listen
+    listen="$(config_webui_listen)"
+    if [[ -n "${listen}" ]]; then
+      console_url="http://${listen}"
+      case "${listen}" in
+        0.0.0.0:*|":*"|"[::]:"*) console_url="http://${listen#*:}（监听所有网卡）" ;;
+      esac
+    fi
+  fi
+  [[ -n "${console_url}" ]] || console_url="未启用"
+
+  printf '  当前状态\n' >&2
+  printf '    版本      %s\n' "${version}" >&2
+  printf '    服务      %s / %s\n' "${service}" "${enabled}" >&2
+  printf '    中转线路  %s 条\n' "${lines}" >&2
+  printf '    控制台    %s\n' "${console_url}" >&2
+}
+
+# do_menu 是「重新运行脚本」时的入口。
+#
+# 装完之后最常见的动作是查看状态、取凭据、改密码，而不是重装。原来这些都
+# 得记住对应的参数，用户只能靠翻 README 或反复试。菜单把这些摆出来，同时
+# 保留所有参数路径不变 —— 带参数运行绝不会进菜单。
+do_menu() {
+  require_root "$@"
+
+  if [[ ! -x "${BIN_PATH}" ]]; then
+    warn "尚未安装，直接开始安装"
+    do_install
+    return
+  fi
+
+  while true; do
+    echo >&2
+    printf '%s╭──────────────────────────────────────────────╮%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
+    printf '%s│           PortTransit 管理菜单               │%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
+    printf '%s╰──────────────────────────────────────────────╯%s\n' "${GREEN}${BOLD}" "${RESET}" >&2
+    echo >&2
+    menu_summary
+    echo >&2
+    printf '  %s1%s) 安装 / 更新服务端（保留现有配置）\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s2%s) 查看运行状态\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s3%s) 查看中转凭据（客户端连接用）\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s4%s) 查看控制台地址与账号\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s5%s) 重置控制台密码\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s6%s) 重启服务\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s7%s) 彻底卸载\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s0%s) 退出\n' "${BOLD}" "${RESET}" >&2
+    echo >&2
+
+    local choice
+    choice="$(read_line '请选择 [0-7]：')"
+    echo >&2
+
+    case "${choice}" in
+      1) do_install ;;
+      2) do_status ;;
+      3)
+        info "中转凭据"
+        if ! "${BIN_PATH}" show-credentials --config "${CONFIG_PATH}" 2>/dev/null; then
+          warn "当前安装的版本不支持 show-credentials，请先选 1 更新"
+        fi
+        echo >&2
+        printf '  一条线路一条凭据；指定名称可看其它线路：\n' >&2
+        printf '    %s show-credentials --name <线路名>\n' "${BIN_PATH}" >&2
+        ;;
+      4)
+        info "控制台"
+        # show-console 是较新版本才有的子命令。旧版会把它当成未知命令并打印
+        # 整页帮助 —— 那看起来像菜单坏了。所以先探测，失败就退回直接读配置。
+        if "${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null; then
+          :
+        else
+          local listen user
+          listen="$(config_webui_listen)"
+          user="$(config_webui_field "username")"
+          if [[ -n "${listen}" ]]; then
+            printf 'listen=%s\n' "${listen}" >&2
+            printf 'url=http://%s\n' "${listen}" >&2
+          fi
+          [[ -n "${user}" ]] && printf 'username=%s\n' "${user}" >&2
+          printf '\n' >&2
+          warn "当前安装的版本不支持 show-console（上面的地址未经公网探测），选 1 可更新"
+        fi
+        echo >&2
+        printf '  密码无法从配置读回（只存了哈希）。忘了就选 5 重设一个。\n' >&2
+        ;;
+      5)
+        info "重置控制台密码"
+        local pw pw2
+        pw="$(read_secret '新密码（留空则随机生成，至少 8 位）：')"
+        if [[ -n "${pw}" ]]; then
+          # 输入不回显，打错了看不见，所以要求再输一遍。
+          pw2="$(read_secret '再输入一次确认：')"
+          if [[ "${pw}" != "${pw2}" ]]; then
+            warn "两次输入不一致，未做修改"
+            continue
+          fi
+          ADMIN_PASSWORD="${pw}"
+        else
+          ADMIN_PASSWORD=""
+        fi
+        do_reset_password
+        ;;
+      6)
+        info "重启服务"
+        systemctl restart "${BIN_NAME}" || warn "重启失败"
+        sleep 1
+        if systemctl is-active --quiet "${BIN_NAME}"; then
+          ok "服务已重启"
+        else
+          warn "服务未在运行，最近日志："
+          journalctl -u "${BIN_NAME}" -n 15 --no-pager 2>/dev/null || true
+        fi
+        ;;
+      7)
+        # do_uninstall 自己会再确认一次；这里不再问，避免连问两遍。
+        do_uninstall
+        return
+        ;;
+      0|"") return ;;
+      *) warn "无效选择：${choice}" ;;
+    esac
+  done
+}
+
 usage() {
   cat >&2 <<'EOF'
 PortTransit 一键脚本
@@ -597,6 +833,8 @@ PortTransit 一键脚本
   --skip-tune          跳过内核网络调优（BBR 等），不写 /etc/sysctl.d
 
 操作：
+  --menu               打开管理菜单（安装/更新、状态、凭据、重置密码、卸载）
+                       已经装过时，不带任何参数重新运行脚本也会进这个菜单
   --uninstall          彻底卸载（删除服务、二进制、配置与数据）
   --keep-data          卸载时保留配置与数据
   --yes, -y            不询问，直接确认卸载（非交互环境必须加）
@@ -612,6 +850,7 @@ PortTransit 一键脚本
 示例：
   sudo bash install.sh
   sudo bash install.sh --transport reality --port 443
+  sudo bash install.sh --menu
   sudo bash install.sh --uninstall
 EOF
 }
@@ -639,8 +878,12 @@ KEEP_DATA=0
 ASSUME_YES=0
 SKIP_TUNE=0
 ACTION="install"
+# 是否有任何参数被显式给出。没有任何参数且已安装时进菜单；只要给了参数就按
+# 参数执行，自动化脚本因此完全不受菜单影响。
+ARGS_GIVEN=0
 
 while [[ $# -gt 0 ]]; do
+  ARGS_GIVEN=1
   case "$1" in
     --transport)       TRANSPORT="${2:?--transport 需要一个值}"; shift 2 ;;
     --port)            PORT="${2:?--port 需要一个值}"; shift 2 ;;
@@ -657,6 +900,7 @@ while [[ $# -gt 0 ]]; do
     --yes|-y)          ASSUME_YES=1; shift ;;
     --reset-password)  ACTION="reset-password"; shift ;;
     --status)          ACTION="status"; shift ;;
+    --menu)            ACTION="menu"; shift ;;
     -h|--help)         usage; exit 0 ;;
     *)                 die "未知参数：$1（使用 --help 查看用法）" ;;
   esac
@@ -675,9 +919,19 @@ if [[ -z "${LISTEN}" && -n "${PORT}" ]]; then
 fi
 
 case "${ACTION}" in
-  install)        do_install ;;
+  install)
+    # 重跑（不带任何参数、且在终端里）时给菜单：装完之后最常见的动作是查看
+    # 状态、取凭据、改密码，而不是重装。带参数时行为完全不变，所以
+    # `curl … | bash -s -- --transport tls --port 8443` 这类用法不受影响。
+    if [[ "${ARGS_GIVEN}" -eq 0 ]] && [[ -x "${BIN_PATH}" ]] && has_terminal; then
+      do_menu
+    else
+      do_install
+    fi
+    ;;
   uninstall)      do_uninstall ;;
   reset-password) do_reset_password ;;
   status)         do_status ;;
+  menu)           do_menu ;;
   *)              die "未知操作：${ACTION}" ;;
 esac
