@@ -879,6 +879,8 @@ cat /etc/sysctl.d/99-porttransit.conf
   `insecure`。指纹格式写错会报错而不是静默跳过校验。
 - 控制台 API 不回显密钥。
 - systemd 单元限制了能力集、只读挂载、禁止提权。
+- 仓库自带凭据扫描：`make lint` 会检查是否有密钥被写进代码，
+  `make check-secrets-history` 扫描全部提交历史。见下面的「不要把凭据提交进仓库」。
 
 需要你自己注意的：
 
@@ -889,6 +891,45 @@ cat /etc/sysctl.d/99-porttransit.conf
 - **自签证书请固定指纹，不要用 `insecure: true`**。`insecure` 是真的不校验
   任何证书，中间人可以直接冒充中转机；只有 `certFingerprint` 才有实际防护，
   见上面的「证书指纹固定」。如果中转机有域名，建议签一张真证书。
+
+### 不要把凭据提交进仓库
+
+配置文件和部署脚本里会同时出现 PSK、UUID、控制台密码哈希，以及
+SSH 的明文密码（远程部署要用）。这些东西一旦进了公开仓库的提交，
+就必须当作已经泄露——**改写历史也救不回来**，别人可能已经拉走了。
+唯一的正确做法是把它们轮换掉。
+
+仓库里做了两层拦截：
+
+```bash
+make hooks           # 安装 git 钩子（core.hooksPath=.githooks），只需一次
+make check-secrets   # 手动扫一遍当前工作区
+make check-secrets-history   # 扫全部提交历史（能发现「提交过又删掉」的密钥）
+```
+
+`make lint` 里也带了这次扫描，所以不用靠记忆。
+
+钩子和扫描脚本本身是公开的，所以**真实的密码和地址不写在里面**，而是放在
+`.secrets-denylist`（已被 `.gitignore` 忽略，每行一个值，`#` 后面是注释）。
+这样扫描器知道要拦哪些值，而它自己仍然可以安全地公开。第一次在新机器上
+工作时记得先建这个文件：
+
+```bash
+cat > .secrets-denylist <<'EOF'
+# 中转机地址
+192.0.2.10
+# SSH 密码
+your-ssh-password
+EOF
+```
+
+`.gitignore` 还忽略了 `/config.json`、`*.local.json`、`*.log` 和 `/dist/`。
+其中 `/dist/`、`/porttransit` 这些**前面带斜杠是故意的**：不加斜杠的
+`porttransit` 会连源码目录 `cmd/porttransit/` 一起忽略掉，命令行入口
+就从仓库里凭空消失了。
+
+如果扫描真的误报了（比如测试里用了一个明显假的夹具），在该行加注释
+`check-secrets:allow` 即可，比放宽整条规则更容易审查。
 
 ---
 
