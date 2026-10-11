@@ -272,10 +272,22 @@ version_lt() {
   return 1
 }
 
-# maybe_downloaded_version：从刚下载的临时二进制里读出它的版本号。
+# probe_binary_version：从刚下载的临时二进制里读出它的版本号。
+#
+# The 0755 is load-bearing, not cosmetic. An extracted tarball member arrives
+# without the execute bit (the release artifact is stored 0666), and this probe
+# runs before the install path's own chmod — so a plain `-x` guard here made the
+# probe return an empty version for every real download. The downgrade check
+# then saw "no version to compare" and let the replacement through, which is
+# exactly the silent downgrade it exists to prevent. Found by running the real
+# download_binary() on a host, not by the unit test, whose fixture was already
+# executable.
 probe_binary_version() {
   local path="$1"
-  [[ -x "${path}" ]] || return 0
+  [[ -f "${path}" ]] || return 0
+  if [[ ! -x "${path}" ]]; then
+    chmod 0755 "${path}" 2>/dev/null || return 0
+  fi
   "${path}" version 2>/dev/null \
     | head -n1 \
     | sed -n 's/.*PortTransit \([0-9][^ ]*\).*/\1/p' \
