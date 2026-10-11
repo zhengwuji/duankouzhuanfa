@@ -406,14 +406,23 @@ show_result() {
   fi
 
   if [[ -n "${console_url}" ]]; then
-    printf '  %s网页控制台%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${console_url}" "${RESET}" >&2
+    # 顺带标一句「外网可访问 / 仅本机」：这是用户最关心的一眼，不该让人从
+    # 地址里自己判断（通配绑定时 show-console 已经把地址换成本机出口 IP）。
+    local console_scope
+    console_scope="$(console_scope_note "${console_listen}")"
+    if [[ -n "${console_scope}" ]]; then
+      printf '  %s网页控制台%s  %s%s%s（%s）\n' \
+        "${BOLD}" "${RESET}" "${GREEN}" "${console_url}" "${RESET}" "${console_scope}" >&2
+    else
+      printf '  %s网页控制台%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${console_url}" "${RESET}" >&2
+    fi
     [[ -n "${console_user}" ]] && printf '  %s管理员账号%s  %s\n' "${BOLD}" "${RESET}" "${console_user}" >&2
     if [[ -n "${ADMIN_PASSWORD_SHOWN}" ]]; then
       printf '  %s管理员密码%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${ADMIN_PASSWORD_SHOWN}" "${RESET}" >&2
     fi
     echo >&2
 
-    if [[ "${console_listen}" == 127.0.0.1:* || "${console_listen}" == localhost:* || "${console_listen}" == "[::1]:"* ]]; then
+    if [[ "$(console_scope_note "${console_listen}")" == "仅本机" ]]; then
       # 只监听本机时上面那个 URL 从外部打不开。直接把能用的命令给出来，
       # 而不是让用户自己意识到这一点。
       local cport="${console_listen##*:}"
@@ -680,6 +689,17 @@ config_webui_listen() {
   config_webui_field "listen"
 }
 
+# console_scope_note <监听地址>：给控制台地址配一句「外网可访问 / 仅本机」。
+# 判定与 set_webui_listen 完全一致（回环、localhost、::1 都算仅本机）；
+# 地址为空时返回空串，调用方据此不显示这句话。
+console_scope_note() {
+  case "$1" in
+    "") printf '%s' "" ;;
+    127.0.0.1:*|localhost:*|"[::1]:"*) printf '%s' "仅本机" ;;
+    *) printf '%s' "外网可访问" ;;
+  esac
+}
+
 # set_webui_listen <地址>：把控制台监听地址写进现有配置，其余字段一个不动。
 #
 # 已经装过的机器上，generate_config 会原样保留配置（那正是它该做的：重跑安装
@@ -717,13 +737,15 @@ menu_summary() {
   console_url="$("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null \
     | sed -n 's/^url=//p' | head -n1 || true)"
   if [[ -z "${console_url}" ]]; then
-    # 旧版二进制没有 show-console，退回到直接读配置。
+    # 旧版二进制没有 show-console，退回到直接读配置。通配绑定时脚本算不出
+    # 本机出口 IP（那是二进制里的事），所以给 <服务器IP> 占位而不是印一个
+    # 谁都打不开的 http://0.0.0.0:8787。
     local listen
     listen="$(config_webui_listen)"
     if [[ -n "${listen}" ]]; then
-      console_url="http://${listen}"
       case "${listen}" in
-        0.0.0.0:*|":*"|"[::]:"*) console_url="http://${listen#*:}（监听所有网卡）" ;;
+        0.0.0.0:*|":*"|"[::]:"*) console_url="http://<服务器IP>:${listen##*:}（监听所有网卡）" ;;
+        *) console_url="http://${listen}" ;;
       esac
     fi
   fi
@@ -733,7 +755,16 @@ menu_summary() {
   printf '    版本      %s\n' "${version}" >&2
   printf '    服务      %s / %s\n' "${service}" "${enabled}" >&2
   printf '    中转线路  %s 条\n' "${lines}" >&2
-  printf '    控制台    %s\n' "${console_url}" >&2
+
+  # 明确写出控制台是「外网可访问」还是「仅本机」：用户就是来看这一眼的，
+  # 不该让人从地址里自己猜（127.0.0.1 与 0.0.0.0 的区别只有懂行的分得清）。
+  local scope
+  scope="$(console_scope_note "$(config_webui_listen)")"
+  if [[ "${console_url}" == "未启用" || -z "${scope}" ]]; then
+    printf '    控制台    %s\n' "${console_url}" >&2
+  else
+    printf '    控制台    %s（%s）\n' "${console_url}" "${scope}" >&2
+  fi
 }
 
 # do_console_access：菜单里的「控制台访问地址（外网 / 仅本机）」。
@@ -745,12 +776,17 @@ menu_summary() {
 # 只改监听地址这一个字段：线路、PSK、控制台密码全部保持原样。重跑 init 也能
 # 达到目的，但那会重新生成凭据，把所有已经配好的客户端打回原点。
 do_console_access() {
-  local current new_listen choice port
+  local current new_listen choice port note
   current="$(config_webui_listen)"
+  note="$(console_scope_note "${current}")"
   [[ -n "${current}" ]] || current="未知"
 
   info "控制台访问地址"
-  printf '  当前监听：%s\n' "${current}" >&2
+  if [[ -n "${note}" ]]; then
+    printf '  当前监听：%s（%s）\n' "${current}" "${note}" >&2
+  else
+    printf '  当前监听：%s\n' "${current}" >&2
+  fi
   echo >&2
   printf '  %s1%s) 外网可访问：0.0.0.0:8787（浏览器直接打开 http://<服务器IP>:8787）\n' "${BOLD}" "${RESET}" >&2
   printf '  %s2%s) 外网可访问：换个端口\n' "${BOLD}" "${RESET}" >&2
@@ -777,7 +813,9 @@ do_console_access() {
   esac
 
   if ! set_webui_listen "${new_listen}"; then
-    warn "修改失败：当前安装的版本可能不支持 set-console，选 1 更新到最新版后重试"
+    warn "修改失败：当前安装的版本还不支持 set-console"
+    printf '      更新到最新版（菜单选 1）后重试；暂时不想更新就用这条等效命令：\n' >&2
+    printf '      curl -fsSL %s/enable-console-remote.sh | sudo bash\n' "${SCRIPT_URL%/*}" >&2
     return
   fi
 
