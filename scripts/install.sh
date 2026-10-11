@@ -404,6 +404,11 @@ show_result() {
   if [[ -z "${console_url}" && -n "${console_listen}" ]]; then
     console_url="http://${console_listen}"
   fi
+  # webui.enabled=false 时控制台根本没在监听，这时还印一个地址是误导：宁可
+  # 明确写「无（控制台已关闭）」，让人知道要去打开它，而不是白点一遍链接。
+  if [[ "$(config_webui_enabled)" == "false" ]]; then
+    console_url=""
+  fi
 
   if [[ -n "${console_url}" ]]; then
     # 顺带标一句「外网可访问 / 仅本机」：这是用户最关心的一眼，不该让人从
@@ -430,6 +435,12 @@ show_result() {
       printf '      ssh -N -L %s:127.0.0.1:%s root@<服务器地址>\n' "${cport}" "${cport}" >&2
       printf '      然后打开 %s\n' "${console_url}" >&2
       printf '      想直接用 服务器IP:%s 打开：进入管理菜单，选 8 改成外网可访问。\n' "${cport}" >&2
+      if ! binary_supports set-console; then
+        # 当前二进制还没有 set-console（v1.1.1 及更早），菜单 8 帮不上忙，
+        # 直接把过渡脚本那条等效命令给出来，用户不用去猜是哪一步缺东西。
+        printf '      当前版本没有 set-console，用这条等效命令立即生效：\n' >&2
+        printf '      curl -fsSL %s/enable-console-remote.sh | sudo bash\n' "${SCRIPT_URL%/*}" >&2
+      fi
       echo >&2
     else
       # 公网可访问就必须说清楚风险：这个后台能改所有线路、还能通过 SSH
@@ -439,6 +450,12 @@ show_result() {
       printf '      改成只监听本机：管理菜单选 8（或重跑安装加 --webui-listen 127.0.0.1:8787）\n' >&2
       echo >&2
     fi
+  else
+    # 拿不到地址也要把这一行印出来：控制台是安装结果里最要紧的一眼，写成
+    # 「无」并说清原因，比留白或者让人以为"没打印就是没问题"要好。
+    printf '  %s网页控制台%s  %s无（%s）%s\n' \
+      "${BOLD}" "${RESET}" "${YELLOW:-}" "$(console_unavailable_reason)" "${RESET}" >&2
+    echo >&2
   fi
 
   printf '  %s服务状态%s  systemctl status %s\n' "${BOLD}" "${RESET}" "${BIN_NAME}" >&2
@@ -494,8 +511,10 @@ do_install() {
   if [[ "${WEBUI_LISTEN_GIVEN}" -eq 1 && "${CONFIG_GENERATED}" -eq 0 ]]; then
     info "更新控制台监听地址"
     if ! set_webui_listen "${WEBUI_LISTEN}"; then
-      warn "控制台监听地址未更新（当前安装的版本可能不支持 set-console）"
-      warn "重跑本脚本即可更新到最新版；也可手动编辑 ${CONFIG_PATH} 里的 webui.listen 与 webui.allowRemote"
+      warn "控制台监听地址未更新（当前安装的版本还没有 set-console）"
+      printf '      用这条等效命令立即生效：curl -fsSL %s/enable-console-remote.sh | sudo bash\n' \
+        "${SCRIPT_URL%/*}" >&2
+      warn "也可以手动编辑 ${CONFIG_PATH} 里的 webui.listen 与 webui.allowRemote"
     fi
   fi
   write_unit
@@ -689,15 +708,45 @@ config_webui_listen() {
   config_webui_field "listen"
 }
 
-# console_scope_note <监听地址>：给控制台地址配一句「外网可访问 / 仅本机」。
-# 判定与 set_webui_listen 完全一致（回环、localhost、::1 都算仅本机）；
+# console_scope_note <监听地址>：给控制台地址配一句「外网可访问 / 内网可访问 /
+# 仅本机」。判定与 set_webui_listen 保持一致（回环、localhost、::1 都算仅本机）；
 # 地址为空时返回空串，调用方据此不显示这句话。
 console_scope_note() {
   case "$1" in
     "") printf '%s' "" ;;
     127.0.0.1:*|localhost:*|"[::1]:"*) printf '%s' "仅本机" ;;
+    0.0.0.0:*|"[::]:"*) printf '%s' "外网可访问" ;;
+    # 私有网段：绑在这些地址上，公网打不开、内网能打开。
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) printf '%s' "内网可访问" ;;
+    # 其余（公网 IP、主机名）一律按对外处理，宁可提醒得重一点。
     *) printf '%s' "外网可访问" ;;
   esac
+}
+
+# config_webui_enabled：读 webui.enabled。它是 JSON 布尔值而不是字符串，所以
+# 不能复用 config_webui_field 的引号匹配。返回 true / false / 空。
+config_webui_enabled() {
+  sed -n '/"webui"[[:space:]]*:/,/^[[:space:]]*}/p' "${CONFIG_PATH}" 2>/dev/null \
+    | sed -E -n 's/.*"enabled"[[:space:]]*:[[:space:]]*(true|false).*/\1/p' \
+    | head -n1 || true
+}
+
+# console_unavailable_reason：控制台这一行拿不到地址时，用一句话说明为什么。
+console_unavailable_reason() {
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    printf '%s' "没有配置文件"
+  elif [[ "$(config_webui_enabled)" == "false" ]]; then
+    printf '%s' "控制台已关闭"
+  elif [[ -z "$(config_webui_listen)" ]]; then
+    printf '%s' "配置里没有 webui.listen"
+  else
+    printf '%s' "读不到控制台信息"
+  fi
+}
+
+# binary_supports <子命令>：问二进制自己的 help 清单，而不是在脚本里写死版本号。
+binary_supports() {
+  "${BIN_PATH}" help 2>/dev/null | grep -q -- "$1"
 }
 
 # set_webui_listen <地址>：把控制台监听地址写进现有配置，其余字段一个不动。
@@ -749,18 +798,27 @@ menu_summary() {
       esac
     fi
   fi
-  [[ -n "${console_url}" ]] || console_url="未启用"
+  # 控制台关掉了就不再给地址（与 show_result 一致）：写了地址用户会去点，
+  # 点开是「无法连接」，不如直接告诉他控制台没开。
+  if [[ "$(config_webui_enabled)" == "false" ]]; then
+    console_url=""
+  fi
+  local scope=""
+  if [[ -n "${console_url}" ]]; then
+    scope="$(console_scope_note "$(config_webui_listen)")"
+  else
+    # 拿不到地址也要有这一行：写「无」并说清原因，而不是留白或印个 未启用。
+    console_url="无（$(console_unavailable_reason)）"
+  fi
 
   printf '  当前状态\n' >&2
   printf '    版本      %s\n' "${version}" >&2
   printf '    服务      %s / %s\n' "${service}" "${enabled}" >&2
   printf '    中转线路  %s 条\n' "${lines}" >&2
 
-  # 明确写出控制台是「外网可访问」还是「仅本机」：用户就是来看这一眼的，
-  # 不该让人从地址里自己猜（127.0.0.1 与 0.0.0.0 的区别只有懂行的分得清）。
-  local scope
-  scope="$(console_scope_note "$(config_webui_listen)")"
-  if [[ "${console_url}" == "未启用" || -z "${scope}" ]]; then
+  # 明确写出控制台是「外网可访问 / 内网可访问 / 仅本机」：用户就是来看这一眼
+  # 的，不该让人从地址里自己猜（127.0.0.1 与 0.0.0.0 的区别只有懂行的分得清）。
+  if [[ -z "${scope}" ]]; then
     printf '    控制台    %s\n' "${console_url}" >&2
   else
     printf '    控制台    %s（%s）\n' "${console_url}" "${scope}" >&2
