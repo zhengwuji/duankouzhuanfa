@@ -1,7 +1,10 @@
 package webui
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -509,6 +512,145 @@ func TestLoginEndpointThrottlesPasswordGuessing(t *testing.T) {
 	s.handleLogin(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("the correct password from an unrelated address returned %d, want 200: an attacker must not be able to lock the operator out", rec.Code)
+	}
+}
+
+// TestShellReferencesVersionedAssets proves the single-page shell points at the
+// current build's script and stylesheet.
+//
+// The asset paths are fixed, so without a version in the URL a browser caches
+// /app.js under a name that never changes. That is how an upgraded console kept
+// serving the previous build's script: the operator opened the console once and
+// then never saw a newly added panel.
+func TestShellReferencesVersionedAssets(t *testing.T) {
+	s := &Server{}
+	h := s.staticHandler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shell returned %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if assetVersion == "" || assetVersion == "dev" {
+		t.Fatalf("assetVersion is %q, so the assets cannot be versioned", assetVersion)
+	}
+
+	for _, want := range []string{
+		`href="/app.css?v=` + assetVersion + `"`,
+		`src="/app.js?v=` + assetVersion + `"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("shell does not reference the versioned asset %s", want)
+		}
+	}
+
+	// The shell itself must never be cached, or a browser stays pinned to the
+	// build whose asset URLs it already holds.
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-cache") {
+		t.Errorf("shell Cache-Control is %q, want no-cache", cc)
+	}
+
+	// A deep link must still serve the same versioned shell.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if !strings.Contains(rec.Body.String(), `src="/app.js?v=`+assetVersion+`"`) {
+		t.Error("deep link served a shell without versioned asset URLs")
+	}
+}
+
+// TestStaticHandlerCachesOnlyVersionedAssets proves the long cache lifetime is
+// granted only to a URL that names the current build, and that revalidation
+// compares content rather than a timestamp shared by every build.
+//
+// The previous behaviour served /app.js as immutable for a year with a constant
+// Last-Modified, so a browser that had loaded the console once could keep the
+// old script across an upgrade and a new panel would never appear.
+func TestStaticHandlerCachesOnlyVersionedAssets(t *testing.T) {
+	s := &Server{}
+	h := s.staticHandler()
+
+	cases := []struct {
+		name     string
+		target   string
+		wantLong bool
+		why      string
+	}{
+		{"versioned script", "/app.js?v=" + assetVersion, true, "a URL naming this build may be cached forever"},
+		{"versioned stylesheet", "/app.css?v=" + assetVersion, true, "a URL naming this build may be cached forever"},
+		{"bare script", "/app.js", false, "a bare path must revalidate, or an upgrade is invisible"},
+		{"stale version", "/app.js?v=000000000000", false, "a URL naming another build must not be cached"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s returned %d, want 200", tc.target, rec.Code)
+			}
+			cc := rec.Header().Get("Cache-Control")
+			long := strings.Contains(cc, "immutable")
+			if long != tc.wantLong {
+				t.Errorf("%s: Cache-Control = %q (long=%v), want long=%v — %s", tc.target, cc, long, tc.wantLong, tc.why)
+			}
+			if got := rec.Header().Get("Etag"); got != `"`+assetVersion+`"` {
+				t.Errorf("%s: Etag = %q, want the content hash %q", tc.target, got, assetVersion)
+			}
+		})
+	}
+
+	// Revalidating with the current ETag must answer 304, which proves the
+	// validator is real rather than an always-200 placeholder.
+	req := httptest.NewRequest(http.MethodGet, "/app.js?v="+assetVersion, nil)
+	req.Header.Set("If-None-Match", `"`+assetVersion+`"`)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("conditional request with the current ETag returned %d, want 304", rec.Code)
+	}
+
+	// A stale ETag must return the new bytes, not a 304 that would leave the
+	// browser holding the previous build.
+	req = httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	req.Header.Set("If-None-Match", `"stale"`)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("conditional request with a stale ETag returned %d, want 200", rec.Code)
+	}
+}
+
+// TestAssetVersionTracksContent proves the version is a content hash, so it
+// changes exactly when the front end does.
+func TestAssetVersionTracksContent(t *testing.T) {
+	if len(assetVersion) != 12 {
+		t.Errorf("assetVersion = %q (len %d), want a 12-character hash", assetVersion, len(assetVersion))
+	}
+	if assetVersion == strings.Repeat("0", 12) {
+		t.Error("assetVersion is all zeroes, which suggests the assets were not hashed")
+	}
+
+	// Hashing the same inputs must be stable across calls, or every request
+	// would produce a different URL.
+	sub, err := fs.Sub(assetsFS, "assets")
+	if err != nil {
+		t.Fatalf("fs.Sub: %v", err)
+	}
+	h := sha256.New()
+	for _, name := range []string{"index.html", "app.css", "app.js"} {
+		data, err := fs.ReadFile(sub, name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(data)
+	}
+	want := hex.EncodeToString(h.Sum(nil))[:12]
+	if assetVersion != want {
+		t.Errorf("assetVersion = %q, recomputed %q", assetVersion, want)
 	}
 }
 

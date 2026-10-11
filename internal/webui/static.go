@@ -3,7 +3,9 @@ package webui
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"io/fs"
 	"net/http"
 	"path"
@@ -22,13 +24,35 @@ import (
 //go:embed assets
 var assetsFS embed.FS
 
-// assetModTime is a fixed timestamp used for cache validators.
+// assetVersion is a short content hash of the front end, used to build a
+// versioned URL for each asset.
 //
-// The assets are compiled into the binary, so their content only changes when
-// the binary does. A constant timestamp is therefore honest, and it lets the
-// browser cache aggressively without ever serving a stale asset for a given
-// build.
-var assetModTime = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+// The asset paths are fixed (/app.js, /app.css), so without a version in the
+// URL a browser has no way to tell one build's script from the next: it caches
+// /app.js under a name that never changes. Combined with a long max-age that
+// meant a browser which had opened the console once kept the previous build's
+// script indefinitely, and an upgrade shipped a new panel that the operator
+// never saw. A content hash is the honest cache key because it changes exactly
+// when the bytes do.
+var assetVersion = func() string {
+	sub, err := fs.Sub(assetsFS, "assets")
+	if err != nil {
+		return "dev"
+	}
+	h := sha256.New()
+	// The names are hashed with the content so that adding or removing a file
+	// also changes the version.
+	for _, name := range []string{"index.html", "app.css", "app.js"} {
+		data, err := fs.ReadFile(sub, name)
+		if err != nil {
+			continue
+		}
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}()
 
 // staticHandler serves the embedded front end, falling back to index.html so a
 // client-side route deep link works on a refresh.
@@ -39,7 +63,6 @@ func (s *Server) staticHandler() http.Handler {
 		// which is a build-time mistake rather than a runtime condition.
 		panic("webui: embedded assets are missing: " + err.Error())
 	}
-	fileServer := http.FileServer(http.FS(sub))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -67,41 +90,53 @@ func (s *Server) staticHandler() http.Handler {
 			return
 		}
 
-		// A fingerprinted asset can be cached forever; the shell must not be,
-		// or an upgrade would keep serving the previous build's script.
-		if strings.HasPrefix(name, "app.") || strings.Contains(name, ".") {
+		// The shell must never be cached: it is the one document that carries
+		// the versioned asset URLs, so caching it would pin a browser to the
+		// build it first saw.
+		if name == "index.html" {
+			serveIndex(w, r, sub)
+			return
+		}
+
+		data, err := fs.ReadFile(sub, name)
+		if err != nil {
+			http.Error(w, "console asset is unavailable", http.StatusInternalServerError)
+			return
+		}
+
+		// Only a URL that carries the current version may be cached forever.
+		// The unversioned path stays revalidating, so a bookmarked or
+		// hand-written /app.js still picks up a new build instead of being
+		// served from cache for a year.
+		if r.URL.Query().Get("v") == assetVersion {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		} else {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
-		http.ServeContent(w, r, name, assetModTime, mustOpen(sub, name))
-		_ = fileServer
+		// The ETag is the content hash, so revalidation compares the bytes
+		// rather than a timestamp that is the same for every build.
+		w.Header().Set("Etag", `"`+assetVersion+`"`)
+		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
 	})
 }
 
-// serveIndex writes the single-page shell.
+// serveIndex writes the single-page shell with versioned asset URLs.
 func serveIndex(w http.ResponseWriter, r *http.Request, sub fs.FS) {
 	data, err := fs.ReadFile(sub, "index.html")
 	if err != nil {
 		http.Error(w, "console assets are unavailable", http.StatusInternalServerError)
 		return
 	}
+	// Point the shell at the current build's assets. The replacements are
+	// literal attribute strings so a missing or renamed reference leaves the
+	// document intact rather than producing a broken URL.
+	body := strings.ReplaceAll(string(data), `href="/app.css"`, `href="/app.css?v=`+assetVersion+`"`)
+	body = strings.ReplaceAll(body, `src="/app.js"`, `src="/app.js?v=`+assetVersion+`"`)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	http.ServeContent(w, r, "index.html", assetModTime, bytes.NewReader(data))
-}
-
-// mustOpen reads an embedded file into memory.
-//
-// The assets are small enough that reading them per request is cheaper than
-// the bookkeeping needed to cache them, and it keeps the handler free of a
-// shared mutable cache that a concurrent request could race.
-func mustOpen(sub fs.FS, name string) *bytes.Reader {
-	data, err := fs.ReadFile(sub, name)
-	if err != nil {
-		return bytes.NewReader(nil)
-	}
-	return bytes.NewReader(data)
+	w.Header().Set("Etag", `"`+assetVersion+`"`)
+	http.ServeContent(w, r, "index.html", time.Time{}, strings.NewReader(body))
 }
 
 // gzipIfAccepted is reserved for deployments that serve the console over a
