@@ -424,6 +424,73 @@ textarea { font-family: var(--mono); min-height: 110px; resize: vertical; }
 .log-line.level-info  .l { color: var(--accent); }
 .log-line.level-debug .l { color: var(--fg-muted); }
 
+/* Guide view ------------------------------------------------------------- */
+
+/* The guide is the one view whose content is prose rather than telemetry, so it
+ * is the one place where a narrower measure and more vertical rhythm matter.
+ * Everything else in this sheet is tuned for scanning dense tables. */
+
+.guide-facts .stat .value { font-size: 14px; }
+
+.guide-step { margin-top: 20px; }
+.guide-step:first-of-type { margin-top: 12px; }
+
+/* .card h3 is styled as a small uppercase section label, which is wrong for a
+ * numbered step heading: it would shrink the step title below the body text it
+ * introduces. */
+.card .guide-step h3 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.guide-num {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-dim);
+  color: #fff;
+  font-size: 12px;
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.guide-step > p { max-width: 76ch; margin: 8px 0; }
+.guide-step .table-wrap { margin: 10px 0; }
+
+.guide-codewrap { position: relative; margin: 10px 0; }
+
+.guide-code {
+  margin: 0;
+  padding: 11px 74px 11px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg);
+}
+
+.guide-copy {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  background: var(--bg-card);
+}
+
 /* Responsive ------------------------------------------------------------- */
 
 @media (max-width: 760px) {

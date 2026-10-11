@@ -150,6 +150,7 @@ function closeModal() { $('#modal').hidden = true; }
 
 const VIEWS = {
   dashboard: { title: '总览', render: renderDashboard },
+  guide: { title: '使用说明', render: renderGuide },
   servers: { title: '中转服务器', render: renderServers },
   tunnels: { title: '端口转发', render: renderTunnels },
   health: { title: '线路健康', render: renderHealth },
@@ -642,6 +643,296 @@ function hostPingPanel(h) {
   }
 
   return card;
+}
+
+/* ------------------------------------------------------------------- guide */
+
+// The guide is written for the console it is running in, not for the project in
+// general: a server-side console and a client-side console are used by different
+// people at different points of the same setup, and each needs the other half
+// only as a handoff ("give these values to the client machine"), not as a full
+// parallel tutorial. The mode decides which half is expanded.
+
+// copyText copies to the clipboard, and tells the truth when it cannot.
+//
+// navigator.clipboard is only defined in a secure context, and this console is
+// normally opened over plain HTTP at an IP address — so the modern API is
+// usually absent here. A button that silently does nothing would be worse than
+// no button, so the fallback selects the text and says what to press instead.
+async function copyText(text, sourceNode) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      toast('已复制', 'ok');
+      return;
+    }
+  } catch (_) { /* fall through to the manual path */ }
+
+  try {
+    const box = document.createElement('textarea');
+    box.value = text;
+    box.setAttribute('readonly', '');
+    box.style.position = 'fixed';
+    box.style.opacity = '0';
+    document.body.append(box);
+    box.select();
+    const ok = document.execCommand('copy');
+    box.remove();
+    if (ok) { toast('已复制', 'ok'); return; }
+  } catch (_) { /* fall through */ }
+
+  // Last resort: leave the text selected so Ctrl+C does the rest. Saying this
+  // is more useful than a failure toast with no next step.
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(sourceNode);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch (_) { /* nothing more we can do */ }
+  toast('浏览器未授权自动复制，内容已选中，请按 Ctrl+C（Mac 为 ⌘C）', 'warn');
+}
+
+// code renders a command block with a copy button. Commands are the part of a
+// tutorial that people get wrong by retyping, so each one is copyable as-is.
+function code(text) {
+  const pre = el('pre', { class: 'guide-code', text: text });
+  const btn = el('button', {
+    class: 'btn small ghost guide-copy',
+    type: 'button',
+    text: '复制',
+    onclick: () => copyText(text, pre),
+  });
+  return el('div', { class: 'guide-codewrap' }, [pre, btn]);
+}
+
+function guideStep(n, title, nodes) {
+  return el('section', { class: 'guide-step' }, [
+    el('h3', {}, [
+      el('span', { class: 'guide-num', text: String(n) }),
+      title,
+    ]),
+    ...[].concat(nodes || []),
+  ]);
+}
+
+function guideNote(kind, text) {
+  return el('div', { class: 'notice' + (kind ? ' ' + kind : ''), text: text });
+}
+
+function guideTable(headers, rows) {
+  return el('div', { class: 'table-wrap' }, [
+    el('table', {}, [
+      el('thead', {}, [el('tr', {}, headers.map((h) => el('th', { text: h })))]),
+      el('tbody', {}, rows.map((r) => el('tr', {}, r.map((c) => el('td', { text: c }))))),
+    ]),
+  ]);
+}
+
+async function renderGuide(host) {
+  clear(host);
+
+  // The console address shown in the examples is this console's own address, so
+  // the reader can paste the command instead of substituting a placeholder.
+  // /api/v1/session does not carry it (it answers "who am I", not "where am I"),
+  // so the status endpoint is asked; a failure only costs the sample address.
+  let consoleURL = 'http://127.0.0.1:8787';
+  try {
+    const status = await api('/api/v1/status');
+    if (status.webui && status.webui.url) consoleURL = status.webui.url;
+  } catch (_) { /* the guide is readable without it */ }
+
+  const session = state.session || {};
+  const mode = session.mode || '';
+  const username = session.username || 'admin';
+  const isServer = mode === 'server' || mode === 'both';
+  const isClient = mode === 'client' || mode === 'both';
+
+  host.append(el('div', { class: 'card' }, [
+    el('h2', { text: '使用说明' }),
+    el('p', { class: 'muted', text: 'PortTransit 把「本地端口」的流量，经一台中转服务器转发到目标地址。'
+      + '下面是从零到可用的完整流程；每一步都给出可以直接复制执行的命令。' }),
+    el('div', { class: 'grid cols-3 guide-facts' }, [
+      stat('当前模式', mode || '—', '', true),
+      stat('控制台地址', consoleURL, '', true),
+      stat('控制台账号', username, '', true),
+    ]),
+  ]));
+
+  // --- What the two ends are ------------------------------------------------
+  host.append(el('div', { class: 'card' }, [
+    el('h2', { text: '先理解两个角色' }),
+    guideTable(
+      ['角色', '跑在哪里', '它做什么'],
+      [
+        ['中转服务端', '一台有公网 IP 的服务器', '监听中转端口，把流量转发到目标；本页控制台通常就跑在它上面'],
+        ['客户端', '你自己的电脑 / 内网机器', '把本地端口的流量加密后送到中转服务端；可以配多条线路自动切换'],
+      ],
+    ),
+    el('p', { class: 'muted small', text: '一句话：客户端负责「出去」，服务端负责「转发」。'
+      + '两边的凭据必须对上——服务端安装时打印的那组 psk / uuid / publicKey 就是要填进客户端的东西。' }),
+  ]));
+
+  // --- Step 1: server -------------------------------------------------------
+  if (isServer) {
+    host.append(el('div', { class: 'card' }, [
+      el('h2', { text: '安装与配置' }),
+      guideStep(1, '在中转服务器上安装（本机已经装好了，这步是给新服务器的）', [
+        el('p', { class: 'muted', text: '在 Debian / Ubuntu 上以 root 运行。装完会打印控制台地址、管理员密码，以及客户端要用的中转凭据——密码只显示一次。' }),
+        code('curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh | sudo bash -s -- --transport tls --port 8443'),
+        el('p', { class: 'muted small', text: '想先看一遍脚本再执行，就把它下载下来：' }),
+        code('wget https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh\nsudo bash install.sh --transport reality --port 443'),
+        guideNote('', '已经装过的机器重新运行这个命令会先进管理菜单（查看状态、取凭据、改密码都在里面），不会直接覆盖。'),
+      ]),
+      guideStep(2, '把客户端要用的凭据取出来', [
+        el('p', { class: 'muted', text: '凭据随时可以重新打印，不需要重装；REALITY 的 publicKey 由服务端保存的私钥现算，所以当时没抄下来也拿得回。' }),
+        code('sudo porttransit show-credentials'),
+        el('p', { class: 'muted small', text: '输出是 key=value 一行一项。这些值下一步要整体作为 JSON 填进客户端。' }),
+      ]),
+      guideStep(3, '确认端口在监听', [
+        code('sudo systemctl status porttransit\nsudo ss -ltnp | grep porttransit'),
+        el('p', { class: 'muted small', text: '「总览」页的「中转服务器」表里，每条线路都应该是「监听中」。'
+          + '如果这里不亮，客户端连不上是必然的，先看「日志」页。' }),
+      ]),
+    ]));
+  }
+
+  // --- Step 2: client -------------------------------------------------------
+  if (isClient) {
+    host.append(el('div', { class: 'card' }, [
+      el('h2', { text: '添加中转服务器' }),
+      guideStep(isServer ? 4 : 1, '在客户端添加一条线路', [
+        el('p', { class: 'muted', text: '打开「中转服务器」页 → 「+ 添加中转服务器」，填四个关键字段：' }),
+        guideTable(
+          ['字段', '填什么', '例子'],
+          [
+            ['名称', '自己认得出的名字', '上海中转'],
+            ['服务器地址', '中转服务器的 IP 或域名 + 端口', '203.0.113.10:8443'],
+            ['协议', '和服务端安装时选的保持一致', 'tls'],
+            ['协议参数', '服务端打印的凭据，写成 JSON 对象', '见下面'],
+          ],
+        ),
+        el('p', { class: 'muted small', text: '最常见的一个错误：凭据要整体作为一个 JSON 对象填进「协议参数」，不是一行一个字段。tls 线路长这样：' }),
+        code('{ "psk": "base64:...", "insecure": true }'),
+        el('p', { class: 'muted small', text: 'reality 线路长这样：' }),
+        code('{ "psk": "...", "publicKey": "...", "shortId": "...", "serverName": "www.bing.com" }'),
+        guideNote('warn', 'insecure: true 只是让自签证书不被拒绝。能拿到证书指纹时请改用 certFingerprint，那才是真正的校验。'),
+      ]),
+      guideStep(isServer ? 5 : 2, '验证这条线路通不通', [
+        el('p', { class: 'muted', text: '在「中转服务器」列表里点那一行的「测试」，或者到「线路健康」页看自动探测的结果。' }),
+        guideTable(
+          ['看到什么', '说明什么', '怎么办'],
+          [
+            ['连通，延迟 12 ms', '握手成功，凭据是对的', '继续下一步'],
+            ['失败：认证失败 / 握手失败', 'psk / uuid / publicKey 和服务端不一致', '重新 show-credentials 取一遍，逐字符核对'],
+            ['失败：连接超时', '端口没开、防火墙挡了、或 IP 写错', '在服务端 ss -ltnp 确认监听，检查安全组与 ufw'],
+            ['失败：证书错误', '协议或 serverName 不对', '协议要和安装时一致；reality 的 serverName 必须是服务端配的那个域名'],
+          ],
+        ),
+      ]),
+    ]));
+
+    // --- Step 3: forwarding -------------------------------------------------
+    host.append(el('div', { class: 'card' }, [
+      el('h2', { text: '新建转发规则' }),
+      guideStep(isServer ? 6 : 3, '把本地端口指到目标地址', [
+        el('p', { class: 'muted', text: '打开「端口转发」页 → 「+ 新建转发」。填「本地监听地址」和「目标地址」两个端点，'
+          + '中间走哪条线路由「指定服务器 / 分组」决定。' }),
+        el('p', { class: 'muted small', text: '例一：把本机的 25565 转发到朋友的 Minecraft 服务器，走中转线路。' }),
+        guideTable(
+          ['本地监听地址', '目标地址', '传输类型'],
+          [
+            ['127.0.0.1:25565', 'mc.example.com:25565', 'TCP'],
+          ],
+        ),
+        el('p', { class: 'muted small', text: '例二：从家里访问公司内网的远程桌面（目标在内网，只有客户端所在网络能到它）。' }),
+        guideTable(
+          ['本地监听地址', '目标地址', '传输类型'],
+          [
+            ['127.0.0.1:13389', '10.0.0.20:3389', 'TCP'],
+          ],
+        ),
+        el('p', { class: 'muted small', text: '例三：转发 UDP（游戏、DNS 这类）。' }),
+        guideTable(
+          ['本地监听地址', '目标地址', '传输类型'],
+          [
+            ['127.0.0.1:5353', '8.8.8.8:53', 'UDP'],
+          ],
+        ),
+        guideNote('warn', '新增或改动「监听端口」后需要重启客户端才会真正绑定端口；只改目标地址这类软配置会热生效。控制台保存时会提示这一点。'),
+      ]),
+      guideStep(isServer ? 7 : 4, '（可选）用本地代理代替逐条转发', [
+        el('p', { class: 'muted', text: '不想一条条配端口时，客户端默认已经开了两个本地代理端口，所有流量按域名走线路：' }),
+        guideTable(
+          ['端口', '协议', '给谁用'],
+          [
+            ['127.0.0.1:1080', 'SOCKS5', '浏览器插件（SwitchyOmega 等）、Telegram、大多数软件'],
+            ['127.0.0.1:8118', 'HTTP', '系统代理、curl、git'],
+          ],
+        ),
+        code('curl --socks5 127.0.0.1:1080 https://ifconfig.me\ncurl --proxy  127.0.0.1:8118 https://ifconfig.me\nHTTPS_PROXY=http://127.0.0.1:8118 curl https://ifconfig.me'),
+        el('p', { class: 'muted small', text: '第一个命令返回中转服务器的出口 IP，就说明整条链路通了。' }),
+        guideNote('warn', '这两个代理默认没有密码，并且只绑定回环地址——它靠「只有本机能连」防护。'
+          + '不要把 socks5Listen / httpListen 改成 0.0.0.0，那等于把你的出口代理开放给整个网络。'),
+      ]),
+    ]));
+  }
+
+  // --- What success looks like ---------------------------------------------
+  host.append(el('div', { class: 'card' }, [
+    el('h2', { text: '最后效果：怎么确认它在正常工作' }),
+    el('p', { class: 'muted', text: '配好之后，控制台这几个地方应该同时是「对」的。任何一处不对，都能顺着它找到出问题的那一段。' }),
+    guideTable(
+      ['位置', '正常的样子', '它在告诉你'],
+      [
+        ['总览 → 活动连接', '有人用时会跳起来', '确实有流量在过中转，而不是只有配置'],
+        ['总览 → 中转服务器表', '每条线路都是「监听中」，已接受在增长', '服务端端口开着，客户端握手成功'],
+        ['总览 → 主机状态', 'CPU / 内存 / 磁盘有实时读数', '这台机器的资源还撑得住（控制台所在这台）'],
+        ['总览 → 出网质量', '平均延迟几十毫秒内、丢包 0%', '这台机器自己的出网是好的'],
+        ['线路健康', '每条线路「正常」，延迟稳定', '客户端 → 中转的握手质量'],
+        ['日志', '没有持续刷屏的 error', '没有反复重连、认证失败这类暗病'],
+      ],
+    ),
+    el('p', { class: 'muted small', text: '「出网质量」量的是控制台这台机器直连公网的质量，'
+      + '「线路健康」量的是客户端到中转的握手延迟——两个数字回答的是不同问题，不要拿来互相解释。' }),
+  ]));
+
+  // --- Troubleshooting -----------------------------------------------------
+  // Two of these rows differ by mode, and getting them wrong is the same defect
+  // as the step split above: `install.sh` is the server installer, so telling a
+  // client operator to run it sends them looking for a script that is not on
+  // their disk.
+  const trouble = [
+    ['客户端连不上，日志刷「握手失败」', '凭据不一致', 'sudo porttransit show-credentials 重新取一遍'],
+    ['端口测试超时', '防火墙 / 安全组没放行', '放行中转端口；服务端 ss -ltnp 确认在听'],
+    ['转发规则保存了但不生效', '监听端口需要重启', '重启客户端进程'],
+    ['升级后看不到新功能', '浏览器缓存了旧外壳', 'Ctrl/Cmd + Shift + R 强刷一次'],
+  ];
+  if (isServer) {
+    trouble.push(
+      ['控制台打不开', '监听地址是 127.0.0.1', 'porttransit set-console --listen 0.0.0.0:8787 --allow-remote 后重启'],
+      ['忘了控制台密码', '密码只存哈希，找不回', 'sudo bash install.sh --reset-password'],
+    );
+  } else {
+    trouble.push(
+      ['控制台打不开', '监听地址是 127.0.0.1', 'porttransit show-console 看地址；本机访问即可，不必暴露到公网'],
+      ['忘了控制台密码', '密码只存哈希，找不回', 'porttransit reset-password'],
+    );
+  }
+
+  host.append(el('div', { class: 'card' }, [
+    el('h2', { text: '卡住了怎么办' }),
+    guideTable(['现象', '最可能的原因', '处理'], trouble),
+    el('p', { class: 'muted small', text: '排查顺序建议从「服务端在不在听」开始，再到「客户端能不能握手」，最后才是「转发规则对不对」——'
+      + '这个顺序每一步都能被上一步证伪，反过来查会同时在三个地方猜。' }),
+    // Only offer views this mode actually has: a shortcut to a page whose nav
+    // entry is hidden in this mode would look like the button is broken.
+    el('div', { class: 'row' }, [
+      el('button', { class: 'btn ghost', type: 'button', text: '看当前运行状态', onclick: () => show('dashboard') }),
+      isClient ? el('button', { class: 'btn ghost', type: 'button', text: '看线路健康', onclick: () => show('health') }) : null,
+      el('button', { class: 'btn ghost', type: 'button', text: '看日志', onclick: () => show('logs') }),
+    ]),
+  ]));
 }
 
 /* ----------------------------------------------------------------- servers */

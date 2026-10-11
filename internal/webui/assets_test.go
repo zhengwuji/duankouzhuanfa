@@ -3,6 +3,7 @@ package webui
 import (
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -277,6 +278,216 @@ func TestHostRefreshReplacesOnlyItsOwnCards(t *testing.T) {
 	if strings.Contains(body, "show(state.view)") || strings.Contains(body, "refreshCurrent()") {
 		t.Error("the host refresh re-renders the whole dashboard, which resets scroll " +
 			"position and rebuilds every other table on the page")
+	}
+}
+
+// The guide view is the third contract. It is documentation shipped inside the
+// binary, so nothing else would catch it drifting: a nav button that points at a
+// view the script never registered renders an empty page with a JS error, and a
+// copy button that cannot copy is worse than no button, because the operator
+// pastes nothing and blames the command.
+
+// TestEveryNavEntryHasAView is the regression test for the failure mode this
+// view could introduce: index.html and app.js both name the views, and adding
+// one to only one of them produces a nav button that silently does nothing.
+func TestEveryNavEntryHasAView(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	// Collect data-view values from the shell.
+	nav := regexp.MustCompile(`data-view="([^"]+)"`).FindAllStringSubmatch(html, -1)
+	if len(nav) == 0 {
+		t.Fatal("index.html has no data-view nav entries; this test would pass vacuously")
+	}
+
+	// Collect the registered view keys. The block is a plain object literal, so
+	// it is read as text rather than parsed: a dependency for one test would be
+	// out of proportion, as with findRule below.
+	block := js[strings.Index(js, "const VIEWS = {"):]
+	if end := strings.Index(block, "\n};"); end >= 0 {
+		block = block[:end]
+	}
+	registered := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\s*([a-zA-Z]+):\s*\{`).FindAllStringSubmatch(block, -1) {
+		registered[m[1]] = true
+	}
+	if len(registered) == 0 {
+		t.Fatal("could not read any view names out of the VIEWS object")
+	}
+
+	for _, m := range nav {
+		if !registered[m[1]] {
+			t.Errorf("index.html offers a nav entry for %q but app.js registers no such view, "+
+				"so clicking it shows an empty page", m[1])
+		}
+	}
+	// And the reverse: a registered view with no button is unreachable.
+	seen := map[string]bool{}
+	for _, m := range nav {
+		seen[m[1]] = true
+	}
+	for name := range registered {
+		if !seen[name] {
+			t.Errorf("app.js registers the view %q but index.html has no nav entry for it, "+
+				"so the operator cannot reach it", name)
+		}
+	}
+}
+
+// TestGuideMatchesTheConsoleItRunsIn pins the part of the guide that would be
+// wrong rather than merely missing.
+//
+// A server-side console has no client half: showing it the "add a relay server"
+// and "new forwarding rule" steps would be instructions for a different machine,
+// and an operator who follows them finds fields that are not there. The guide
+// therefore branches on the mode, and both branches must exist.
+func TestGuideMatchesTheConsoleItRunsIn(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	for _, want := range []string{
+		"const isServer = mode === 'server' || mode === 'both';",
+		"const isClient = mode === 'client' || mode === 'both';",
+		"if (isServer) {",
+		"if (isClient) {",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("the guide does not branch on the console's mode (missing %q), "+
+				"so it tells at least one mode to use a page it does not have", want)
+		}
+	}
+
+	// install.sh is the server installer. A client-mode console that tells the
+	// operator to run it sends them looking for a file that is not on their
+	// machine, so that row must sit inside the server branch of the
+	// troubleshooting table — not merely somewhere in the guide.
+	//
+	// The segment is cut out explicitly rather than searched from the top: the
+	// guide has two `if (isServer)` blocks (the step list and the troubleshooting
+	// rows), and a looser search would keep passing after the one under test was
+	// deleted.
+	start := strings.Index(js, "const trouble = [")
+	if start < 0 {
+		t.Fatal("the troubleshooting rows are no longer built from a `trouble` array; this test needs updating")
+	}
+	seg := js[start:]
+	if end := strings.Index(seg, "guideTable(['现象'"); end >= 0 {
+		seg = seg[:end]
+	}
+	open := strings.Index(seg, "if (isServer) {")
+	if open < 0 {
+		t.Fatal("the troubleshooting rows are no longer gated on the mode; this test needs updating")
+	}
+	shared := seg[:open]
+	serverSide, clientSide := seg[open:], ""
+	if mid := strings.Index(seg[open:], "} else {"); mid >= 0 {
+		serverSide = seg[open : open+mid]
+		clientSide = seg[open+mid:]
+	}
+
+	const installRow = "install.sh --reset-password"
+	if strings.Contains(shared, installRow) {
+		t.Error("the install.sh row is in the shared troubleshooting rows, so a client-mode " +
+			"console offers the operator a script that only exists on a server")
+	}
+	if !strings.Contains(serverSide, installRow) {
+		t.Error("the server branch no longer tells the operator how to reset a forgotten console " +
+			"password, which is the one recovery path for a hash-only password")
+	}
+	if strings.Contains(clientSide, installRow) {
+		t.Error("the client branch mentions the server installer")
+	}
+	// The client half must still have its own answer for the same problem.
+	if !strings.Contains(clientSide, "porttransit reset-password") {
+		t.Error("a client-mode console has no way to recover a forgotten password")
+	}
+}
+
+// TestGuideCommandsAreCopyable keeps the tutorial's commands from becoming
+// retype-only. The clipboard API needs a secure context and this console is
+// normally opened over plain HTTP at an IP, so the fallback path is the one that
+// actually runs in practice — and it must say what to do when it fails rather
+// than reporting success it did not achieve.
+func TestGuideCommandsAreCopyable(t *testing.T) {
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "app.css")
+
+	if !strings.Contains(js, "async function copyText(") {
+		t.Fatal("the guide has no copy helper; this test needs updating")
+	}
+	if !strings.Contains(js, "navigator.clipboard && window.isSecureContext") {
+		t.Error("the copy helper uses the clipboard API without checking for a secure context, " +
+			"where it is undefined — which is the normal case for an HTTP console at an IP")
+	}
+	if !strings.Contains(js, "document.execCommand('copy')") {
+		t.Error("the copy helper has no fallback for a non-secure context, so the copy " +
+			"buttons do nothing on the deployment the guide is written for")
+	}
+	// Failing must not look like succeeding.
+	if !strings.Contains(js, "'浏览器未授权自动复制，内容已选中，请按 Ctrl+C（Mac 为 ⌘C）'") {
+		t.Error("a copy that could not happen reports nothing the operator can act on")
+	}
+
+	// The copy button is absolutely positioned over the code block, so the block
+	// must reserve room for it or the first line renders underneath the button.
+	// Checking for the word "padding" would pass on `padding: 0`, so the reserved
+	// right-hand width is read out and compared against the button's own width.
+	rule := findRule(css, ".guide-code")
+	if rule == "" {
+		t.Fatal("app.css has no .guide-code rule; this test needs updating")
+	}
+	right, ok := paddingRight(rule)
+	if !ok {
+		t.Error("the code block has no padding, so its first line renders under the copy button")
+	} else if right < 60 {
+		t.Errorf("the code block reserves only %gpx on the right, less than the copy button "+
+			"occupies, so long first lines run under it", right)
+	}
+
+	// The absolute positioning only works against a positioned ancestor.
+	if r := findRule(css, ".guide-codewrap"); r == "" || !strings.Contains(r, "position: relative") {
+		t.Error("the code wrapper is not positioned, so the copy button escapes to the page " +
+			"and lands wherever the nearest positioned ancestor is")
+	}
+	if r := findRule(css, ".guide-copy"); r == "" || !strings.Contains(r, "position: absolute") {
+		t.Error("the copy button is not positioned over the code block")
+	}
+}
+
+// paddingRight returns the right-hand padding of a declaration block in pixels.
+//
+// The padding shorthand is expanded the way CSS does it: one value applies to
+// every side, two to vertical then horizontal, four to top/right/bottom/left.
+func paddingRight(rule string) (float64, bool) {
+	m := regexp.MustCompile(`padding:\s*([^;]+);`).FindStringSubmatch(rule)
+	if m == nil {
+		return 0, false
+	}
+	fields := strings.Fields(m[1])
+	// Pull the px value for the right side.
+	var idx int
+	switch len(fields) {
+	case 1:
+		idx = 0
+	case 2, 3:
+		idx = 1
+	default:
+		idx = 1
+	}
+	val := strings.TrimSuffix(fields[idx], "px")
+	n, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// TestGuideIsReachableFromTheSidebar is deliberately narrow: it is the one thing
+// about the new page that a screenshot would not catch, namely that the entry
+// sits in the nav the operator actually looks at.
+func TestGuideIsReachableFromTheSidebar(t *testing.T) {
+	html := readAsset(t, "index.html")
+	if !strings.Contains(html, `<button class="nav-item" data-view="guide">使用说明</button>`) {
+		t.Error("the guide is not offered in the sidebar nav")
 	}
 }
 
