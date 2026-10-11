@@ -307,3 +307,48 @@ func TestSchemaVersionRejectsFuture(t *testing.T) {
 		t.Errorf("the error does not explain the version mismatch: %v", err)
 	}
 }
+
+// TestHostPanelProblemsAreReportedButNotFatal is the regression test for a
+// mistyped probe target stopping the relay.
+//
+// Validate is fatal — app.New returns it and the process never binds a socket —
+// which is the right weight for a listener that could never work. A status
+// panel is not: the relay serves traffic perfectly well with the panel empty,
+// so refusing to start over a typo in it would turn a cosmetic mistake into an
+// outage. The problems are surfaced through HostProblems instead, because a
+// panel that is silently empty looks like a bug in the panel.
+func TestHostPanelProblemsAreReportedButNotFatal(t *testing.T) {
+	cfg := Default(ModeServer)
+	cfg.Host.Interval = Duration(10 * time.Millisecond)
+	cfg.Host.PingInterval = Duration(time.Second)
+	cfg.Host.PingTimeout = Duration(time.Millisecond)
+	cfg.Host.PingCount = 500
+	cfg.Host.PingTargets = []string{"", "1.1.1.1:443", "not an address"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a bad host panel setting refused to start the relay: %v", err)
+	}
+
+	problems := cfg.HostProblems()
+	if len(problems) == 0 {
+		t.Fatal("the broken host panel settings were reported as no problem at all, " +
+			"so the operator would see an empty panel and no reason for it")
+	}
+	joined := strings.Join(problems, "; ")
+	for _, want := range []string{"host.interval", "host.pingInterval", "host.pingTimeout", "host.pingCount", "host.pingTargets[0]", "host.pingTargets[2]"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the reported problems do not mention %s: %s", want, joined)
+		}
+	}
+}
+
+// TestDefaultHostSettingsAreProblemFree keeps the defaults from tripping the
+// checks above, which would log a warning on every clean install.
+func TestDefaultHostSettingsAreProblemFree(t *testing.T) {
+	for _, mode := range []Mode{ModeServer, ModeClient, ModeBoth} {
+		cfg := Default(mode)
+		if problems := cfg.HostProblems(); len(problems) != 0 {
+			t.Errorf("the %s defaults report problems: %v", mode, problems)
+		}
+	}
+}

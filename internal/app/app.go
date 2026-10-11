@@ -21,6 +21,7 @@ import (
 
 	"porttransit/internal/client"
 	"porttransit/internal/config"
+	"porttransit/internal/hostmon"
 	"porttransit/internal/logx"
 	"porttransit/internal/server"
 	"porttransit/internal/version"
@@ -49,6 +50,7 @@ type App struct {
 	server *server.Server
 	client *client.Client
 	webui  *webui.Server
+	host   *hostmon.Monitor
 
 	mu      sync.Mutex
 	stopped bool
@@ -137,6 +139,28 @@ func New(opts Options) (*App, error) {
 		a.client = cli
 	}
 
+	// The host monitor feeds the console's resource panel, so it is built only
+	// when there is a console to feed. Sampling a host nobody can look at would
+	// be pure overhead on a small VPS.
+	if cfg.Host.Enabled && cfg.WebUI.Enabled {
+		// Reported, not fatal: see Config.HostProblems. A typo in a status
+		// panel must not stop the relay from starting.
+		for _, p := range cfg.HostProblems() {
+			a.log.Warn("主机监控配置有问题", "problem", p)
+		}
+		a.host = hostmon.New(hostmon.Options{
+			Interval:     cfg.Host.Interval.Std(),
+			PingInterval: cfg.Host.PingInterval.Std(),
+			// A nil list means "the built-in targets"; an explicitly empty one
+			// means the operator turned outbound probing off, and the monitor
+			// preserves that distinction.
+			PingTargets: cfg.Host.PingTargets,
+			PingCount:   cfg.Host.PingCount,
+			PingTimeout: cfg.Host.PingTimeout.Std(),
+			Logger:      a.log,
+		})
+	}
+
 	if cfg.WebUI.Enabled {
 		ui, err := webui.New(webui.Options{
 			Config: cfg,
@@ -145,6 +169,7 @@ func New(opts Options) (*App, error) {
 			Buffer: buf,
 			Server: a.server,
 			Client: a.client,
+			Host:   a.host,
 		})
 		if err != nil {
 			return nil, err
@@ -216,8 +241,19 @@ func (a *App) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	// The host monitor starts before the console so that the first dashboard a
+	// browser loads already has a reading; it is the one subsystem whose failure
+	// is not fatal, because the console is still useful without the panel.
+	if a.host != nil {
+		if err := a.host.Start(ctx); err != nil {
+			a.log.Warn("主机资源采集未能启动", "err", err)
+		}
+	}
 	if a.webui != nil {
 		if err := a.webui.Start(ctx); err != nil {
+			if a.host != nil {
+				a.host.Stop()
+			}
 			if a.client != nil {
 				a.client.Stop()
 			}
@@ -264,6 +300,9 @@ func (a *App) Stop() {
 		if a.webui != nil {
 			a.webui.Stop()
 		}
+		if a.host != nil {
+			a.host.Stop()
+		}
 		if a.client != nil {
 			a.client.Stop()
 		}
@@ -298,6 +337,9 @@ func (a *App) Client() *client.Client { return a.client }
 
 // WebUI returns the management interface, or nil when it is disabled.
 func (a *App) WebUI() *webui.Server { return a.webui }
+
+// Host returns the host resource monitor, or nil when it is disabled.
+func (a *App) Host() *hostmon.Monitor { return a.host }
 
 // Logger returns the shared logger.
 func (a *App) Logger() *logx.Logger { return a.log }

@@ -243,7 +243,15 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"valid": true, "errors": []string{}})
+	// The host panel's settings are reported as warnings rather than errors:
+	// they do not stop the relay, but an operator who typed one wrong should be
+	// told here instead of finding an empty panel later and assuming the panel
+	// is broken.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"valid":    true,
+		"errors":   []string{},
+		"warnings": candidate.HostProblems(),
+	})
 }
 
 // handleReload re-reads the configuration file from disk.

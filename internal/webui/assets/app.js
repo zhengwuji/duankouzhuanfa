@@ -160,6 +160,7 @@ const VIEWS = {
 
 async function show(viewName) {
   state.view = viewName;
+  stopHostRefresh();
   const view = VIEWS[viewName];
   $('#view-title').textContent = view.title;
   for (const btn of document.querySelectorAll('.nav-item')) {
@@ -178,11 +179,74 @@ async function show(viewName) {
 
 async function refreshCurrent() { await show(state.view); }
 
+/* ---------------------------------------------------------- host refresh */
+
+// The overview is the one view that polls: the relay's counters are already
+// live through the relay itself, but CPU and memory are only interesting when
+// they are current, and a page that silently freezes while an operator watches
+// a spike is worse than one that never claimed to be live.
+let hostTimer = null;
+
+function stopHostRefresh() {
+  if (hostTimer !== null) {
+    clearInterval(hostTimer);
+    hostTimer = null;
+  }
+}
+
+function startHostRefresh(seconds) {
+  stopHostRefresh();
+  const period = Math.max(2, Number(seconds) || 0) * 1000;
+  hostTimer = setInterval(refreshHostPanels, period);
+}
+
+// refreshHostPanels redraws only the two host cards, in place.
+//
+// Re-rendering the whole dashboard would reset the scroll position and rebuild
+// the relay tables every few seconds, which on a page an operator is reading is
+// worse than slightly stale numbers.
+async function refreshHostPanels() {
+  if (state.view !== 'dashboard') { stopHostRefresh(); return; }
+  // A console left open in a background tab should not keep polling: nobody is
+  // reading the numbers, and the first thing the operator sees on returning is
+  // the next tick's fresh reading anyway.
+  if (document.hidden) return;
+  const host = $('#view');
+  if (!host || !host.querySelector('[data-host-panel]')) { stopHostRefresh(); return; }
+
+  let info;
+  try {
+    info = await api('/api/v1/host');
+  } catch (err) {
+    // A single failed poll is not worth interrupting the operator for; the
+    // next tick retries. Only a lost session matters, and api() handles that.
+    return;
+  }
+  // The view may have been replaced while the request was in flight.
+  const anchor = host.querySelector('[data-host-panel]');
+  if (!anchor) { stopHostRefresh(); return; }
+  anchor.replaceWith(hostPanel(info));
+  const ping = host.querySelector('[data-host-ping]');
+  if (ping) ping.replaceWith(hostPingPanel(info));
+}
+
 /* --------------------------------------------------------------- dashboard */
 
 async function renderDashboard(host) {
   const status = await api('/api/v1/status');
   state.status = status;
+
+  // Host telemetry is a separate request so that a host which cannot be
+  // sampled — or an endpoint that is simply absent — degrades to one missing
+  // panel instead of blanking the whole overview. The relay's own numbers are
+  // the more important half of this page.
+  let hostInfo = null;
+  try {
+    hostInfo = await api('/api/v1/host');
+  } catch (err) {
+    hostInfo = { available: false, reason: err.message };
+  }
+
   clear(host);
 
   const version = status.version || {};
@@ -223,16 +287,28 @@ async function renderDashboard(host) {
   ]);
   host.append(info);
 
+  host.append(hostPanel(hostInfo));
+  host.append(hostPingPanel(hostInfo));
+
   if (server) {
     host.append(relayPanel(server));
   }
   if (client) {
     host.append(clientPanel(client));
   }
+
+  // Keep the resource numbers live while the operator is looking at them. The
+  // period comes from the server so the page cannot poll faster than the
+  // sampler produces new values, which would only redraw identical numbers.
+  const period = Number(hostInfo && hostInfo.pollSeconds) || 0;
+  if (period > 0) startHostRefresh(period);
 }
 
-function stat(label, value, unit) {
-  const valueNode = el('div', { class: 'value' }, [
+// small renders the value at label size. Hardware identity — a CPU model name,
+// a kernel version — is prose, not a number, and at 22px monospace it overflows
+// the card instead of being read.
+function stat(label, value, unit, small) {
+  const valueNode = el('div', { class: small ? 'value small' : 'value' }, [
     String(value),
     unit ? el('span', { class: 'unit', text: unit }) : null,
   ]);
@@ -333,6 +409,239 @@ function clientPanel(client) {
         ])
       : el('div', { class: 'empty', text: '尚未配置端口转发规则' }),
   ]);
+}
+
+/* -------------------------------------------------------------------- host */
+
+/* Host telemetry. This is the machine the console runs on, not the relay's
+ * peers: an operator's first question about a slow tunnel is whether the box
+ * itself is the problem, and until now the console could only answer about the
+ * relay. */
+
+// Thresholds match the badge colours so a nearly-full disk and a busy CPU read
+// the same way everywhere in the console.
+function toneFor(pct) {
+  const v = Number(pct) || 0;
+  if (v >= 90) return 'bad';
+  if (v >= 75) return 'warn';
+  return '';
+}
+
+function usageBar(pct) {
+  const v = Math.max(0, Math.min(100, Number(pct) || 0));
+  return el('div', { class: 'usage' }, [
+    el('div', { class: 'usage-fill ' + toneFor(v), style: `width:${v}%` }),
+  ]);
+}
+
+function usageRow(name, pct, right, title) {
+  return el('div', { class: 'usage-row' }, [
+    el('div', { class: 'name', text: name, title: title || name }),
+    usageBar(pct),
+    el('div', { class: 'val', text: right }),
+  ]);
+}
+
+// One narrow column per logical CPU. An average hides a single pegged core,
+// which is exactly the shape a relay's encryption load takes on a small VPS.
+function coreBars(list) {
+  return el('div', { class: 'core-bars' }, list.map((pct) => {
+    const v = Math.max(0, Math.min(100, Number(pct) || 0));
+    return el('div', { class: 'core-bar', title: `${v}%` }, [
+      el('i', { class: toneFor(v), style: `height:${v}%` }),
+    ]);
+  }));
+}
+
+function hostPanel(h) {
+  const card = el('div', { class: 'card', 'data-host-panel': '' }, [el('h2', { text: '主机状态' })]);
+  const fresh = h && h.pollSeconds
+    ? `控制台所在这台机器的资源占用，每 ${h.pollSeconds} 秒采样一次。`
+    : '控制台所在这台机器的资源占用。';
+  card.append(el('p', { class: 'muted', text: fresh }));
+
+  // An unsupported host is reported, never hidden: a missing panel and a panel
+  // that says "this platform exposes nothing" are different facts.
+  if (!h || !h.available) {
+    card.append(el('div', { class: 'empty', text: (h && h.reason) || '此平台不支持主机资源采集' }));
+    return card;
+  }
+
+  const cpu = h.cpu || {};
+  const mem = h.memory || {};
+  const swap = h.swap || {};
+  const load = h.load || {};
+  const net = h.network || {};
+  const sys = h.system || {};
+
+  card.append(el('div', { class: 'grid cols-4' }, [
+    stat('CPU 使用率', (Number(cpu.usagePct) || 0).toFixed(1), '%'),
+    stat('负载 (1 分钟)', (Number(load.one) || 0).toFixed(2)),
+    stat('内存占用', (Number(mem.usagePct) || 0).toFixed(1), '%'),
+    stat('进程数', num(sys.processCount), '个'),
+  ]));
+
+  const meters = el('div', {});
+  const coreCount = Number(cpu.cores) || 0;
+  meters.append(usageRow(
+    'CPU',
+    cpu.usagePct,
+    `${(Number(cpu.usagePct) || 0).toFixed(1)}%${coreCount ? ` · ${coreCount} 核` : ''}`,
+    cpu.model || 'CPU',
+  ));
+  meters.append(usageRow(
+    '内存',
+    mem.usagePct,
+    `${bytes(mem.usedBytes)} / ${bytes(mem.totalBytes)}`,
+    mem.availableBytes ? `可用 ${bytes(mem.availableBytes)}` : '',
+  ));
+  // Swap is only shown when the host actually has some: a row reading
+  // "0 B / 0 B" on every machine without swap is noise.
+  if (Number(swap.totalBytes) > 0) {
+    meters.append(usageRow('交换分区', swap.usagePct, `${bytes(swap.usedBytes)} / ${bytes(swap.totalBytes)}`));
+  }
+  for (const d of h.disks || []) {
+    const label = d.mount || d.device;
+    const suffix = d.readOnly ? ' · 只读' : '';
+    meters.append(usageRow(
+      label,
+      d.usagePct,
+      `${bytes(d.usedBytes)} / ${bytes(d.totalBytes)}${suffix}`,
+      `${d.device || ''} ${d.fstype || ''}`.trim(),
+    ));
+  }
+  card.append(meters);
+
+  if (cpu.perCorePct && cpu.perCorePct.length > 1) {
+    card.append(el('h3', { text: '每核占用' }));
+    card.append(coreBars(cpu.perCorePct));
+  }
+
+  const loadLine = `${(Number(load.one) || 0).toFixed(2)} / ${(Number(load.five) || 0).toFixed(2)} / ${(Number(load.fifteen) || 0).toFixed(2)}`;
+  card.append(el('h3', { text: '网络与负载' }));
+  card.append(el('div', { class: 'grid cols-4' }, [
+    stat('下行速率', bytes(net.rxBytesPerSecond), '/s'),
+    stat('上行速率', bytes(net.txBytesPerSecond), '/s'),
+    stat('累计下行', bytes(net.rxBytes)),
+    stat('累计上行', bytes(net.txBytes)),
+  ]));
+  card.append(el('div', { class: 'grid cols-4' }, [
+    stat('负载 1/5/15', loadLine, '', true),
+    stat('每核负载', (Number(load.perCore) || 0).toFixed(2)),
+    stat('TCP 连接', num(net.tcpConnections), '条'),
+    stat('TCP 监听', num(net.tcpListeners), '个'),
+  ]));
+
+  const errs = (Number(net.rxErrors) || 0) + (Number(net.txErrors) || 0);
+  const drops = (Number(net.rxDropped) || 0) + (Number(net.txDropped) || 0);
+  if (errs || drops) {
+    // Only surfaced when non-zero: a permanent "0 errors" row trains an
+    // operator to stop reading it, which is the opposite of its purpose.
+    card.append(el('div', { class: 'notice warn', text: `网卡错误 ${num(errs)} 个，丢包 ${num(drops)} 个` }));
+  }
+
+  const thermal = (h.thermal || []).filter((t) => Number(t.tempC) > 0);
+  if (thermal.length) {
+    card.append(el('h3', { text: '温度' }));
+    card.append(el('div', { class: 'grid cols-4' }, thermal.map((t) =>
+      stat(t.label || t.zone, (Number(t.tempC) || 0).toFixed(1), '°C')
+    )));
+  }
+
+  card.append(el('h3', { text: '硬件与系统' }));
+  card.append(el('div', { class: 'grid cols-3' }, [
+    stat('CPU 型号', cpu.model || '未知', '', true),
+    stat('架构', cpu.arch || sys.arch || '未知', '', true),
+    stat('主机名', sys.hostname || '未知', '', true),
+    stat('操作系统', sys.distro || sys.os || '未知', '', true),
+    stat('内核', sys.kernel || '未知', '', true),
+    stat('虚拟化', sys.virtualization || '未知', '', true),
+    stat('主机运行时长', duration(h.uptimeSeconds)),
+    stat('逻辑核心', num(sys.numCpu), '个'),
+    stat('CPU 频率', (Number(cpu.mhz) || 0).toFixed(0), 'MHz'),
+  ]));
+
+  return card;
+}
+
+function pingMethodLabel(method) {
+  switch (method) {
+    case 'icmp': return 'ICMP';
+    case 'tcp': return 'TCP 握手';
+    case 'mixed': return 'ICMP / TCP 混合';
+    default: return '—';
+  }
+}
+
+function hostPingPanel(h) {
+  const ping = h.ping || {};
+  const card = el('div', { class: 'card', 'data-host-ping': '' }, [
+    el('h2', { text: '出网质量' }),
+    el('p', {
+      class: 'muted',
+      text: '本机直连公网的延迟与丢包。它是「线路慢」和「这台机器出网慢」之间的分界线，与客户端到中转的握手延迟不是一回事。',
+    }),
+  ]);
+
+  if (!ping.enabled) {
+    card.append(el('div', { class: 'empty', text: '未启用（配置中的 host.pingTargets 为空）' }));
+    return card;
+  }
+
+  // A round takes a few seconds and runs as soon as the monitor starts, so the
+  // first page load can arrive before any result exists. Showing four zeroes
+  // then would read as "the network is perfect" instead of "not measured yet",
+  // which is the same class of lie as presenting a handshake as an ICMP trip.
+  if (!ping.lastAt) {
+    card.append(el('div', { class: 'empty', text: '正在测量…' }));
+    return card;
+  }
+
+  card.append(el('div', { class: 'grid cols-4' }, [
+    stat('平均延迟', (Number(ping.avgMs) || 0).toFixed(1), 'ms'),
+    stat('最低延迟', (Number(ping.minMs) || 0).toFixed(1), 'ms'),
+    stat('最高延迟', (Number(ping.maxMs) || 0).toFixed(1), 'ms'),
+    stat('丢包率', (Number(ping.lossPct) || 0).toFixed(1), '%'),
+  ]));
+
+  const rows = (ping.targets || []).map((t) => {
+    const loss = Number(t.lossPct) || 0;
+    const lossCell = loss > 0
+      ? el('td', {}, [el('span', { class: loss >= 50 ? 'badge bad' : 'badge warn', text: `${loss.toFixed(1)}%` })])
+      : el('td', { class: 'mono', text: '0%' });
+    return el('tr', {}, [
+      el('td', { class: 'mono', text: t.address }),
+      el('td', { text: pingMethodLabel(t.method) }),
+      el('td', { text: num(t.sent) }),
+      el('td', { text: num(t.recv) }),
+      el('td', { class: 'mono', text: Number(t.recv) > 0 ? `${(Number(t.avgMs) || 0).toFixed(1)} ms` : '—' }),
+      lossCell,
+      t.error ? el('td', { class: 'muted small', text: t.error }) : el('td', { text: '—' }),
+    ]);
+  });
+
+  card.append(el('div', { class: 'table-wrap' }, [
+    el('table', {}, [
+      el('thead', {}, [el('tr', {}, [
+        el('th', { text: '目标' }), el('th', { text: '方式' }), el('th', { text: '发送' }),
+        el('th', { text: '接收' }), el('th', { text: '平均延迟' }), el('th', { text: '丢包' }),
+        el('th', { text: '备注' }),
+      ])]),
+      el('tbody', {}, rows),
+    ]),
+  ]));
+
+  // The measurement method is stated because an ICMP round trip and a TCP
+  // handshake to the same host are not comparable numbers, and a card that
+  // showed one as the other would be quietly wrong.
+  const notes = [`测量方式：${pingMethodLabel(ping.method)}`];
+  if (ping.lastAt) notes.push(`最近探测：${shortTime(ping.lastAt)}`);
+  card.append(el('p', { class: 'muted small', text: notes.join('　·　') }));
+  if (ping.error) {
+    card.append(el('div', { class: 'notice warn', text: ping.error }));
+  }
+
+  return card;
 }
 
 /* ----------------------------------------------------------------- servers */
@@ -882,8 +1191,9 @@ async function renderSettings(host) {
         try {
           const parsed = JSON.parse(editor.value);
           const res = await api('/api/v1/config/validate', { method: 'POST', body: { config: parsed } });
-          if (res.valid) toast('配置校验通过', 'ok');
-          else toast('配置有问题：' + (res.errors || []).join('；'), 'bad');
+          if (!res.valid) toast('配置有问题：' + (res.errors || []).join('；'), 'bad');
+          else if ((res.warnings || []).length) toast('校验通过，但有提醒：' + res.warnings.join('；'), 'warn');
+          else toast('配置校验通过', 'ok');
         } catch (err) { toast(err.message, 'bad'); }
       }}),
       el('button', { class: 'btn ghost', type: 'button', text: '重新载入', onclick: refreshCurrent }),
@@ -897,6 +1207,10 @@ async function renderSettings(host) {
     try {
       const res = await api('/api/v1/config/validate', { method: 'POST', body: { config: parsed } });
       if (!res.valid) { toast('配置未通过校验：' + (res.errors || []).join('；'), 'bad'); return; }
+      if ((res.warnings || []).length) {
+        toast('配置校验通过，但有提醒：' + res.warnings.join('；'), 'warn');
+        return;
+      }
       toast('配置校验通过。请通过 SSH 或服务管理命令写入并重启服务。', 'ok');
     } catch (err) {
       toast(err.message, 'bad');
@@ -960,6 +1274,10 @@ function textarea(label, value) {
 /* -------------------------------------------------------------- auth flow */
 
 function showLogin() {
+  // The dashboard is gone, so its poller must stop with it: otherwise it keeps
+  // requesting a protected endpoint from the login screen and every tick throws
+  // a 401 that the operator cannot act on.
+  stopHostRefresh();
   $('#app').hidden = true;
   $('#login').hidden = false;
   const pass = $('#login-pass');

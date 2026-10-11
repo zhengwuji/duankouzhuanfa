@@ -31,6 +31,7 @@ import (
 
 	"porttransit/internal/client"
 	"porttransit/internal/config"
+	"porttransit/internal/hostmon"
 	"porttransit/internal/logx"
 	"porttransit/internal/server"
 	"porttransit/internal/transport"
@@ -56,6 +57,9 @@ type Options struct {
 	Server *server.Server
 	// Client is the client, or nil when this process is server-only.
 	Client *client.Client
+	// Host samples the machine this console runs on. Nil disables the host
+	// panel, which is what a build for a platform with no collector does.
+	Host *hostmon.Monitor
 }
 
 // Server is the management HTTP server.
@@ -66,6 +70,7 @@ type Server struct {
 	buffer *logx.Buffer
 	relay  *server.Server
 	cli    *client.Client
+	host   *hostmon.Monitor
 
 	sessions *sessionStore
 	// logins throttles password guessing. It only matters when the console is
@@ -100,6 +105,7 @@ func New(opts Options) (*Server, error) {
 		buffer:   opts.Buffer,
 		relay:    opts.Server,
 		cli:      opts.Client,
+		host:     opts.Host,
 		sessions: newSessionStore(ttl),
 		logins:   newLoginThrottle(),
 	}, nil
@@ -221,6 +227,7 @@ func (s *Server) routes() http.Handler {
 
 	// Authenticated API.
 	mux.HandleFunc("/api/v1/status", s.auth(s.handleStatus))
+	mux.HandleFunc("/api/v1/host", s.auth(s.handleHost))
 	mux.HandleFunc("/api/v1/config", s.auth(s.handleConfig))
 	mux.HandleFunc("/api/v1/config/validate", s.auth(s.handleValidate))
 	mux.HandleFunc("/api/v1/reload", s.auth(s.handleReload))

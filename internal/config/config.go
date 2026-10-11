@@ -51,6 +51,9 @@ type Config struct {
 	Log LogConfig `json:"log"`
 	// WebUI configures the management HTTP server.
 	WebUI WebUIConfig `json:"webui"`
+	// Host configures the host resource panel shown on the console dashboard.
+	// It describes the machine the console runs on, whichever role that is.
+	Host HostConfig `json:"host"`
 	// Server holds relay-side settings. Nil when Mode is ModeClient.
 	Server *ServerConfig `json:"server,omitempty"`
 	// Client holds client-side settings. Nil when Mode is ModeServer.
@@ -430,6 +433,30 @@ type HealthConfig struct {
 	AutoFailover bool `json:"autoFailover,omitempty"`
 }
 
+// HostConfig controls the host resource panel.
+//
+// The panel describes the machine the console is running on, which is the relay
+// host in server mode and the local machine in client mode. Sampling is on by
+// default because an operator diagnosing a slow tunnel needs to know whether the
+// host is the problem, and the cost of reading /proc a few times a minute is
+// negligible next to the traffic being relayed.
+type HostConfig struct {
+	// Enabled turns the host panel on.
+	Enabled bool `json:"enabled"`
+	// Interval is the resource sampling period.
+	Interval Duration `json:"interval,omitempty"`
+	// PingInterval is the delay between outbound probe rounds.
+	PingInterval Duration `json:"pingInterval,omitempty"`
+	// PingTargets are the addresses probed to measure this host's own outbound
+	// network quality. An empty list disables probing; an absent field uses a
+	// built-in set of public anycast resolvers.
+	PingTargets []string `json:"pingTargets,omitempty"`
+	// PingCount is how many probes each target receives per round.
+	PingCount int `json:"pingCount,omitempty"`
+	// PingTimeout bounds a single probe.
+	PingTimeout Duration `json:"pingTimeout,omitempty"`
+}
+
 // Duration is a time.Duration that marshals as a human string ("30s") so
 // configs stay readable.
 type Duration time.Duration
@@ -491,6 +518,13 @@ func Default(mode Mode) *Config {
 			Listen:     "127.0.0.1:8787",
 			Username:   "admin",
 			SessionTTL: Duration(12 * time.Hour),
+		},
+		Host: HostConfig{
+			Enabled:      true,
+			Interval:     Duration(5 * time.Second),
+			PingInterval: Duration(30 * time.Second),
+			PingCount:    3,
+			PingTimeout:  Duration(1500 * time.Millisecond),
 		},
 	}
 	if mode == ModeServer || mode == ModeBoth {
@@ -662,6 +696,13 @@ func (c *Config) Validate() error {
 	if c.Client != nil {
 		problems = append(problems, validateClient(c.Client)...)
 	}
+	// Host panel settings are deliberately NOT part of this list. Validate is
+	// fatal — app.New returns it and the process does not start — and that is
+	// the right weight for a relay line that could never work. A mistyped probe
+	// target is not: the relay runs perfectly well with the host panel showing
+	// nothing, and refusing to start eight working listeners over a typo in a
+	// status display would be a worse failure than the typo. They are reported
+	// through HostProblems instead, which the caller logs.
 
 	// A section the mode requires but which is absent would otherwise start a
 	// process that silently does nothing.
@@ -680,6 +721,62 @@ func (c *Config) Validate() error {
 		return nil
 	}
 	return fmt.Errorf("config: %s", strings.Join(problems, "; "))
+}
+
+// HostProblems reports the host panel settings that are wrong.
+//
+// It is separate from Validate because these are not fatal. Validate is the
+// gate that decides whether the process may start, and a relay line that could
+// never work belongs there; a status panel that will show nothing does not.
+// Refusing to start eight working listeners because a probe target has a typo
+// would turn a cosmetic mistake into an outage.
+//
+// The caller reports these and starts anyway. They exist because silence is the
+// worse outcome: a panel that is quietly empty looks like a bug in the panel.
+func (c *Config) HostProblems() []string {
+	return validateHost(&c.Host)
+}
+
+// validateHost checks the host panel settings.
+//
+// Every problem here is a setting that would make the panel silently useless:
+// an interval so short it becomes a load source, or a probe target that is not
+// an address at all.
+func validateHost(h *HostConfig) []string {
+	var problems []string
+	add := func(format string, args ...any) {
+		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+
+	// Below a second the sampler would cost more than it reports, and the
+	// deltas would be dominated by the sampling itself.
+	if h.Interval != 0 && h.Interval.Std() < time.Second {
+		add("host.interval %s is too short; use at least 1s", h.Interval.Std())
+	}
+	if h.PingInterval != 0 && h.PingInterval.Std() < 5*time.Second {
+		add("host.pingInterval %s is too short; use at least 5s", h.PingInterval.Std())
+	}
+	if h.PingCount < 0 {
+		add("host.pingCount %d is negative", h.PingCount)
+	}
+	if h.PingCount > 20 {
+		add("host.pingCount %d is too large; use at most 20", h.PingCount)
+	}
+	if h.PingTimeout != 0 && h.PingTimeout.Std() < 100*time.Millisecond {
+		add("host.pingTimeout %s is too short; use at least 100ms", h.PingTimeout.Std())
+	}
+	for i, t := range h.PingTargets {
+		if strings.TrimSpace(t) == "" {
+			add("host.pingTargets[%d] is empty", i)
+			continue
+		}
+		// A bare host is allowed (the probe supplies the port), so only reject
+		// something that could not be an address under any reading.
+		if strings.ContainsAny(t, " \t/") {
+			add("host.pingTargets[%d] %q is not a host or host:port", i, t)
+		}
+	}
+	return problems
 }
 
 func validateServer(s *ServerConfig) []string {

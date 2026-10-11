@@ -192,6 +192,65 @@ body {
 .stat .value.small { font-size: 15px; }
 .stat .unit { font-size: 12px; color: var(--fg-muted); font-weight: 400; margin-left: 3px; }
 
+/* Usage meters ------------------------------------------------------------ */
+
+/* Host utilisation is the one place in this console where a bare number is
+ * hard to read: "72.4%" takes a moment, a bar does not. The thresholds match
+ * the badges so a full disk and a busy CPU read the same way everywhere. */
+
+.usage {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.usage-fill { height: 100%; background: var(--accent); transition: width .3s ease; }
+.usage-fill.warn { background: var(--warn); }
+.usage-fill.bad  { background: var(--bad); }
+
+.usage-row {
+  display: grid;
+  grid-template-columns: 92px 1fr 76px;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.usage-row .name {
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-row .usage { margin-top: 0; }
+
+.usage-row .val { text-align: right; font-family: var(--mono); }
+
+/* Per-core occupancy. One narrow column per logical CPU: a single pegged core
+ * on an otherwise idle box is invisible in an average, and that is exactly the
+ * shape a relay's encryption load takes. */
+.core-bars { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 10px; }
+
+.core-bar {
+  width: 12px;
+  height: 30px;
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.core-bar > i { display: block; width: 100%; background: var(--accent); }
+.core-bar > i.warn { background: var(--warn); }
+.core-bar > i.bad  { background: var(--bad); }
+
 /* Tables ----------------------------------------------------------------- */
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
