@@ -23,6 +23,16 @@ const state = {
   logs: [],
 };
 
+// True while the login form's own request is in flight.
+//
+// api() answers a 401 by showing the login form, which clears the password
+// field. That is right for an expired session on an authenticated call, and
+// wrong for a rejected login: it wiped the password the operator had just
+// typed, so a mistyped character looked like the console refusing to accept
+// anything at all. The handler that is already on the login form owns that
+// case and reports the server's message itself.
+let waitingOnLogin = false;
+
 /* ---------------------------------------------------------------- utilities */
 
 const $ = (sel, root) => (root || document).querySelector(sel);
@@ -102,8 +112,17 @@ async function api(path, options) {
     try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
   }
   if (resp.status === 401) {
-    showLogin();
-    throw new Error('登录已过期，请重新登录');
+    // A 401 does not always mean an expired session: it is also what the login
+    // endpoint returns for a wrong password. Reporting every one of them as
+    // "登录已过期，请重新登录" told an operator who had simply mistyped their
+    // password that their session had expired — and, on the login form itself,
+    // it sent them looking for a session problem that did not exist.
+    //
+    // The server's own message is preferred whenever it sent one; the generic
+    // wording is only the fallback for a bare 401 from an authenticated call.
+    const serverMessage = data && (data.errors ? data.errors.join('；') : data.error);
+    if (!waitingOnLogin) showLogin();
+    throw new Error(serverMessage || '登录已过期，请重新登录');
   }
   if (!resp.ok) {
     const detail = data && (data.errors ? data.errors.join('；') : data.error) || resp.statusText;
@@ -995,6 +1014,7 @@ $('#login-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const errBox = $('#login-error');
   errBox.hidden = true;
+  waitingOnLogin = true;
   try {
     await api('/api/v1/login', {
       method: 'POST',
@@ -1004,6 +1024,8 @@ $('#login-form').addEventListener('submit', async (ev) => {
   } catch (err) {
     errBox.textContent = err.message;
     errBox.hidden = false;
+  } finally {
+    waitingOnLogin = false;
   }
 });
 

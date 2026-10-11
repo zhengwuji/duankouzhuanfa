@@ -41,6 +41,24 @@
 
 * { box-sizing: border-box; }
 
+/* The hidden attribute must actually hide, whatever display this sheet declares.
+ *
+ * The console switches between the login form and the app by setting .hidden in
+ * JavaScript. That relied on the user-agent rule `[hidden] { display: none }`,
+ * which any author `display` declaration overrides — and this sheet declares
+ * `#app { display: flex }` and `.login-wrap { display: flex }`. The result was
+ * that both were painted at once on every load: the console frame with its nav
+ * and an empty view, plus the login form underneath, which reads as "the
+ * console is broken" rather than "you are not logged in yet".
+ *
+ * !important rather than a per-element rule: every element the script toggles
+ * is covered by it, including ones added later, so the two can no longer drift
+ * apart. The alternative (.nav-item[hidden] and .modal[hidden], which this file
+ * already needed) has to be repeated for each element and was already missed
+ * for two of them.
+ */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
