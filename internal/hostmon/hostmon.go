@@ -375,6 +375,13 @@ func (m *Monitor) Start(ctx context.Context) error {
 	m.mu.Lock()
 	m.prev = first
 	m.snap = buildSnapshot(first, nil, m.opts)
+	// Whether probing is switched on is a configuration fact, so it is set here
+	// rather than left to the first completed round. The first round takes a few
+	// seconds, and until it lands the console would otherwise report the ping
+	// card as "not enabled (host.pingTargets is empty)" — a specific explanation
+	// that is simply untrue, and one an operator would act on by editing a
+	// configuration that was already correct.
+	m.snap.Ping = PingInfo{Enabled: len(m.opts.PingTargets) > 0}
 	m.mu.Unlock()
 
 	m.wg.Add(1)

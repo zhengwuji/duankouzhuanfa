@@ -41,6 +41,62 @@ func TestUnsupportedHostIsReportedNotFatal(t *testing.T) {
 	}
 }
 
+// TestProbingStateIsKnownBeforeTheFirstRound pins the difference between "not
+// measured yet" and "not enabled".
+//
+// Enabled describes the configuration, not the result of a probe, so it must be
+// true from the moment the monitor starts. When it was only set by a completed
+// round, the console reported the ping card as "not enabled (host.pingTargets is
+// empty)" for the first seconds of every run — a specific explanation that is
+// untrue, and one an operator would act on by editing a correct configuration.
+func TestProbingStateIsKnownBeforeTheFirstRound(t *testing.T) {
+	// An unroutable address (TEST-NET-1) with a long timeout keeps the first
+	// round from finishing during the test, which is what makes the "before the
+	// first result" state observable at all.
+	const unroutable = "192.0.2.1:443"
+
+	t.Run("configured targets report enabled immediately", func(t *testing.T) {
+		f := newFixture(t)
+		f.use()
+
+		m := New(Options{
+			Interval:    time.Second,
+			PingTargets: []string{unroutable},
+			PingTimeout: 30 * time.Second,
+		})
+		if err := m.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		t.Cleanup(m.Stop)
+
+		snap := m.Snapshot()
+		if !snap.Ping.Enabled {
+			t.Error("Ping.Enabled = false right after Start, so the console tells " +
+				"the operator that host.pingTargets is empty when it is not")
+		}
+		if !snap.Ping.LastAt.IsZero() {
+			t.Error("the test needs the first round to still be running; it finished, " +
+				"so this assertion is not testing what it claims")
+		}
+	})
+
+	t.Run("an empty target list still reports disabled", func(t *testing.T) {
+		f := newFixture(t)
+		f.use()
+
+		m := New(Options{Interval: time.Second, PingTargets: []string{}})
+		if err := m.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		t.Cleanup(m.Stop)
+
+		if m.Snapshot().Ping.Enabled {
+			t.Error("Ping.Enabled = true with no targets configured, so the console " +
+				"promises measurements that will never arrive")
+		}
+	})
+}
+
 // TestReadRawParsesAKernelTree proves the collector reads a realistic tree:
 // the aggregate line is kept separate from the cores, memory is taken from
 // MemAvailable, and the loopback interface is marked so the totals can skip it.
