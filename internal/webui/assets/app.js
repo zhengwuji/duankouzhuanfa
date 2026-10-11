@@ -779,7 +779,7 @@ async function renderGuide(host) {
       el('h2', { text: '安装与配置' }),
       guideStep(1, '在中转服务器上安装（本机已经装好了，这步是给新服务器的）', [
         el('p', { class: 'muted', text: '在 Debian / Ubuntu 上以 root 运行。装完会打印控制台地址、管理员密码，以及客户端要用的中转凭据——密码只显示一次。' }),
-        code('curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh | sudo bash -s -- --transport tls --port 8443'),
+        code('curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh | sudo bash'),
         el('p', { class: 'muted small', text: '想先看一遍脚本再执行，就把它下载下来：' }),
         code('wget https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh\nsudo bash install.sh --transport reality --port 443'),
         guideNote('', '已经装过的机器重新运行这个命令会先进管理菜单（查看状态、取凭据、改密码都在里面），不会直接覆盖。'),

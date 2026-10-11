@@ -60,7 +60,7 @@
 Debian / Ubuntu，root 权限：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh | sudo bash -s -- --transport tls --port 8443
+curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/install.sh | sudo bash
 ```
 
 或者把脚本下载下来看一遍再执行：
@@ -1248,6 +1248,19 @@ scripts/install.sh        一键脚本
 ---
 
 ## 更新日志
+
+### v1.3.1
+
+**修复**
+
+- **安装命令改回最短形式**：README「快速开始」和控制台「使用说明」页第 1 步原来写的是
+  `… install.sh | sudo bash -s -- --transport tls --port 8443`，现在统一为
+  `… install.sh | sudo bash`。
+  - 两者**完全等价**，不是简化了功能：脚本里 `TRANSPORT="tls"` 是默认值，tls 的默认
+    监听是 `0.0.0.0:8443`（`internal/config/config.go` 的默认配置），所以那三个参数
+    本来就是在重复默认值。
+  - 之所以改：多出来的参数会让人以为「不写就跑不起来」，而它其实是可选的；管道形式
+    下 `-s --` 也容易被漏掉，少写一个 `--` 参数就会静默丢失。
 
 ### v1.3.0
 
