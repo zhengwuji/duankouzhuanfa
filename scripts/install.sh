@@ -213,9 +213,73 @@ $(printf '  %s\n' "${urls[@]}")
     rm -rf "${tmpdir}" "${BIN_PATH}.tar.gz"
   fi
 
+  # Refuse to downgrade.
+  #
+  # The installer always fetched whatever `releases/latest` pointed at, with no
+  # comparison against what is already running. So re-running the documented
+  # install command on a host that had already been given a newer binary by some
+  # other route replaced it with the older published one — silently restoring
+  # bugs that had already been fixed there, and looking like a successful
+  # install while doing it. A published release is always behind whatever is
+  # being worked on, so "latest" is not automatically "newest for this host".
+  #
+  # PORTTRANSIT_BINARY is exempt because it is an explicit local instruction and
+  # returns earlier; --force-downgrade is the escape hatch for the case where an
+  # operator really does want to go back.
+  if [[ "${FORCE_DOWNGRADE}" -ne 1 ]]; then
+    local have want
+    have="$(installed_version)"
+    want="$(probe_binary_version "${BIN_PATH}.tmp")"
+    if [[ -n "${have}" && -n "${want}" ]] && version_lt "${want}" "${have}"; then
+      rm -f "${BIN_PATH}.tmp"
+      warn "已安装的版本更新，跳过替换：已装 ${have}，这次下载到的是 ${want}"
+      printf '      要强制回退到 %s：加 --force-downgrade\n' "${want}" >&2
+      printf '      要保持当前版本：什么都不用做，服务仍在运行 %s\n' "${have}" >&2
+      return
+    fi
+  fi
+
   chmod 0755 "${BIN_PATH}.tmp"
   mv "${BIN_PATH}.tmp" "${BIN_PATH}"
   ok "已安装到 ${BIN_PATH}"
+}
+
+# installed_version：读出当前已装二进制的版本号（例如 1.1.2），读不到则返回空。
+installed_version() {
+  [[ -x "${BIN_PATH}" ]] || return 0
+  "${BIN_PATH}" version 2>/dev/null \
+    | head -n1 \
+    | sed -n 's/.*PortTransit \([0-9][^ ]*\).*/\1/p' \
+    | head -n1 || true
+}
+
+# version_lt <a> <b>：a 是否比 b 旧。按数字段比较，缺失段按 0 处理，
+# 所以 1.1.2 > 1.1.1、1.10 > 1.9。任一段不是数字就直接认为不旧（保守：
+# 宁可当成"不降级"，也不要因为解析奇怪版本号而拒绝一个正常安装）。
+version_lt() {
+  local a="$1" b="$2"
+  [[ -n "${a}" && -n "${b}" ]] || return 1
+  local IFS=.
+  local -a A=(${a}) B=(${b})
+  local i x y
+  for i in 0 1 2 3 4 5 6 7; do
+    x="${A[$i]:-0}"; y="${B[$i]:-0}"
+    [[ "${x}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${y}" =~ ^[0-9]+$ ]] || return 1
+    if (( 10#${x} < 10#${y} )); then return 0; fi
+    if (( 10#${x} > 10#${y} )); then return 1; fi
+  done
+  return 1
+}
+
+# maybe_downloaded_version：从刚下载的临时二进制里读出它的版本号。
+probe_binary_version() {
+  local path="$1"
+  [[ -x "${path}" ]] || return 0
+  "${path}" version 2>/dev/null \
+    | head -n1 \
+    | sed -n 's/.*PortTransit \([0-9][^ ]*\).*/\1/p' \
+    | head -n1 || true
 }
 
 create_dirs() {
@@ -1046,6 +1110,9 @@ PortTransit 一键脚本
                            只允许本机访问请用 --webui-listen 127.0.0.1:8787
   --force-config       覆盖已存在的配置（会重新生成全部凭据）
   --skip-tune          跳过内核网络调优（BBR 等），不写 /etc/sysctl.d
+  --force-downgrade    允许用较旧版本覆盖本机已装的更新版本
+                       默认拒绝降级：脚本取 releases/latest，而 latest 往往
+                       落后于本机已经装上的版本
 
 操作：
   --menu               打开管理菜单（安装/更新、状态、凭据、重置密码、卸载、
@@ -1102,6 +1169,9 @@ CONFIG_GENERATED=0
 KEEP_DATA=0
 ASSUME_YES=0
 SKIP_TUNE=0
+# 是否允许用较旧版本覆盖已装的较新版本。默认不允许：脚本总是取
+# releases/latest，而 latest 一定落后于本机可能已经装上的更新版本。
+FORCE_DOWNGRADE=0
 ACTION="install"
 
 while [[ $# -gt 0 ]]; do
@@ -1116,6 +1186,7 @@ while [[ $# -gt 0 ]]; do
     --webui-allow-remote) WEBUI_ALLOW_REMOTE=1; shift ;;
     --force-config)    FORCE_CONFIG=1; shift ;;
     --skip-tune)       SKIP_TUNE=1; shift ;;
+    --force-downgrade) FORCE_DOWNGRADE=1; shift ;;
     --uninstall)       ACTION="uninstall"; shift ;;
     --keep-data)       KEEP_DATA=1; shift ;;
     --yes|-y)          ASSUME_YES=1; shift ;;
