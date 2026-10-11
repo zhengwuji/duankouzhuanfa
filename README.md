@@ -349,7 +349,16 @@ sudo systemctl restart porttransit
 porttransit show-console                            # 确认新地址
 ```
 
-三条路都只改配置文件里的 `webui.listen` 与 `webui.allowRemote`：**线路、管理员
+二进制还没有 `set-console`（v1.1.1 及更早）时用仓库里这个过渡脚本，做的事完全
+一样，但自带备份、改完的加载校验和失败回滚：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhengwuji/duankouzhuanfa/main/scripts/enable-console-remote.sh | sudo bash
+# 换端口：sudo PORT=9443 bash enable-console-remote.sh
+# 改回仅本机：sudo bash enable-console-remote.sh --loopback
+```
+
+以上几种做法都只改配置文件里的 `webui.listen` 与 `webui.allowRemote`：**线路、管理员
 密码、客户端凭据全都不动**（想改协议/端口请用 `--force-config`，那才是重生成
 全部凭据的那条路）。几个行为细节：
 
