@@ -418,13 +418,14 @@ show_result() {
       printf '  %s控制台只监听本机%s，从外部浏览器打开需要一条 SSH 隧道：\n' "${BOLD}" "${RESET}" >&2
       printf '      ssh -N -L %s:127.0.0.1:%s root@<服务器地址>\n' "${cport}" "${cport}" >&2
       printf '      然后打开 %s\n' "${console_url}" >&2
+      printf '      想直接用 服务器IP:%s 打开：进入管理菜单，选 8 改成外网可访问。\n' "${cport}" >&2
       echo >&2
     else
       # 公网可访问就必须说清楚风险：这个后台能改所有线路、还能通过 SSH
       # 往别的服务器装服务端。提醒用户改密码，并说明已有防爆破。
       warn "控制台可被公网访问（${console_listen}），请立即修改管理员密码。"
       printf '      登录失败会递增锁定：前 5 次不惩罚，之后每次翻倍，最长锁 15 分钟。\n' >&2
-      printf '      只允许本机访问：重新执行安装并加 --webui-listen 127.0.0.1:8787\n' >&2
+      printf '      改成只监听本机：管理菜单选 8（或重跑安装加 --webui-listen 127.0.0.1:8787）\n' >&2
       echo >&2
     fi
   fi
@@ -471,6 +472,20 @@ do_install() {
   create_dirs
   download_binary
   generate_config
+
+  # 配置已存在时上面的 init 不会执行，--webui-listen 会被静默忽略 —— 用户会
+  # 以为已经改成外网可访问，实际控制台还留在老地址上。显式给了参数就必须真的
+  # 改掉，而且只改这一个字段：线路与凭据保持原样。
+  #
+  # 没有显式给参数时什么都不做：沿用中的监听地址是运维自己定的（可能出于安全
+  # 考虑），绝不能被脚本的默认值悄悄覆盖成对外网开放。
+  if [[ "${WEBUI_LISTEN_GIVEN}" -eq 1 && "${CONFIG_GENERATED}" -eq 0 ]]; then
+    info "更新控制台监听地址"
+    if ! set_webui_listen "${WEBUI_LISTEN}"; then
+      warn "控制台监听地址未更新（当前安装的版本可能不支持 set-console）"
+      warn "重跑本脚本即可更新到最新版；也可手动编辑 ${CONFIG_PATH} 里的 webui.listen 与 webui.allowRemote"
+    fi
+  fi
   write_unit
   # 放在启动之前：服务起来时就已经跑在调优后的内核参数上了。
   tune_kernel
@@ -662,6 +677,23 @@ config_webui_listen() {
   config_webui_field "listen"
 }
 
+# set_webui_listen <地址>：把控制台监听地址写进现有配置，其余字段一个不动。
+#
+# 已经装过的机器上，generate_config 会原样保留配置（那正是它该做的：重跑安装
+# 不该动线路和凭据），所以重跑时给的 --webui-listen 曾经被静默忽略：用户看到
+# 「安装完成」，控制台却还在老地址上。改这一步交给二进制的 set-console ——
+# 它加载、校验、原子写入，密码与线路凭据都不碰；直接 sed 改 JSON 则绕过了
+# 校验，改错一个字段的后果是服务起不来。
+set_webui_listen() {
+  local addr="$1"
+  local args=(set-console --config "${CONFIG_PATH}" --listen "${addr}")
+  case "${addr}" in
+    127.0.0.1:*|localhost:*|"[::1]:"*) ;;
+    *) args+=(--allow-remote) ;;
+  esac
+  "${BIN_PATH}" "${args[@]}" >&2
+}
+
 # menu_summary 打印当前状态，让用户在选之前知道自己面对的是什么。
 menu_summary() {
   local version service enabled lines console_url
@@ -701,6 +733,87 @@ menu_summary() {
   printf '    控制台    %s\n' "${console_url}" >&2
 }
 
+# do_console_access：菜单里的「控制台访问地址（外网 / 仅本机）」。
+#
+# 装完之后第二常见的事就是这件：安装时沿用的旧配置里控制台只监听本机，想在
+# 浏览器里直接用 服务器IP:端口 打开，却只能去翻配置文件手改 JSON —— 而手改
+# JSON 一旦漏掉 allowRemote，服务下次启动会直接拒绝启动。
+#
+# 只改监听地址这一个字段：线路、PSK、控制台密码全部保持原样。重跑 init 也能
+# 达到目的，但那会重新生成凭据，把所有已经配好的客户端打回原点。
+do_console_access() {
+  local current new_listen choice port
+  current="$(config_webui_listen)"
+  [[ -n "${current}" ]] || current="未知"
+
+  info "控制台访问地址"
+  printf '  当前监听：%s\n' "${current}" >&2
+  echo >&2
+  printf '  %s1%s) 外网可访问：0.0.0.0:8787（浏览器直接打开 http://<服务器IP>:8787）\n' "${BOLD}" "${RESET}" >&2
+  printf '  %s2%s) 外网可访问：换个端口\n' "${BOLD}" "${RESET}" >&2
+  printf '  %s3%s) 仅本机：127.0.0.1:8787（外部访问需要 SSH 隧道）\n' "${BOLD}" "${RESET}" >&2
+  printf '  %s0%s) 取消\n' "${BOLD}" "${RESET}" >&2
+  echo >&2
+
+  choice="$(read_line '请选择 [0-3]：')"
+  echo >&2
+
+  case "${choice}" in
+    1) new_listen="0.0.0.0:8787" ;;
+    2)
+      port="$(read_line '端口（1-65535，例如 8787）：')"
+      if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( 10#${port} < 1 || 10#${port} > 65535 )); then
+        warn "端口无效：${port}"
+        return
+      fi
+      new_listen="0.0.0.0:${port}"
+      ;;
+    3) new_listen="127.0.0.1:8787" ;;
+    0|"") return ;;
+    *) warn "无效选择：${choice}"; return ;;
+  esac
+
+  if ! set_webui_listen "${new_listen}"; then
+    warn "修改失败：当前安装的版本可能不支持 set-console，选 1 更新到最新版后重试"
+    return
+  fi
+
+  # 换了端口就要顺手放行，否则浏览器照样连不上，而用户以为已经开好了。
+  case "${new_listen}" in
+    127.0.0.1:*|localhost:*|"[::1]:"*) ;;
+    *) ensure_firewall_open "${new_listen##*:}" ;;
+  esac
+
+  info "重启服务以生效"
+  if systemctl restart "${BIN_NAME}" 2>/dev/null && sleep 1 \
+     && systemctl is-active --quiet "${BIN_NAME}"; then
+    ok "服务已重启"
+  else
+    warn "服务未能重启，最近日志："
+    journalctl -u "${BIN_NAME}" -n 15 --no-pager 2>/dev/null || true
+  fi
+  echo >&2
+
+  # 地址仍以 show-console 为准（通配绑定会换成主机自己的出口地址）。
+  local url listen
+  listen="$(config_webui_listen)"
+  url="$("${BIN_PATH}" show-console --config "${CONFIG_PATH}" 2>/dev/null \
+    | sed -n 's/^url=//p' | head -n1 || true)"
+  [[ -n "${url}" ]] || url="http://${listen}"
+  printf '  %s网页控制台%s  %s%s%s\n' "${BOLD}" "${RESET}" "${GREEN}" "${url}" "${RESET}" >&2
+
+  case "${new_listen}" in
+    127.0.0.1:*|localhost:*|"[::1]:"*)
+      printf '  只监听本机，外部浏览器需要一条 SSH 隧道：\n' >&2
+      printf '      ssh -N -L %s:127.0.0.1:%s root@<服务器地址>\n' "${new_listen##*:}" "${new_listen##*:}" >&2
+      ;;
+    *)
+      warn "控制台现在可被公网访问，请确保管理员密码足够强。"
+      printf '      想改回仅本机：再进本菜单选 8，然后选 3。\n' >&2
+      ;;
+  esac
+}
+
 # do_menu 是「重新运行脚本」时的入口。
 #
 # 装完之后最常见的动作是查看状态、取凭据、改密码，而不是重装。原来这些都
@@ -730,11 +843,12 @@ do_menu() {
     printf '  %s5%s) 重置控制台密码\n' "${BOLD}" "${RESET}" >&2
     printf '  %s6%s) 重启服务\n' "${BOLD}" "${RESET}" >&2
     printf '  %s7%s) 彻底卸载\n' "${BOLD}" "${RESET}" >&2
+    printf '  %s8%s) 控制台访问地址（外网 / 仅本机）\n' "${BOLD}" "${RESET}" >&2
     printf '  %s0%s) 退出\n' "${BOLD}" "${RESET}" >&2
     echo >&2
 
     local choice
-    choice="$(read_line '请选择 [0-7]：')"
+    choice="$(read_line '请选择 [0-8]：')"
     echo >&2
 
     case "${choice}" in
@@ -803,6 +917,7 @@ do_menu() {
         do_uninstall
         return
         ;;
+      8) do_console_access ;;
       0|"") return ;;
       *) warn "无效选择：${choice}" ;;
     esac
@@ -827,13 +942,15 @@ PortTransit 一键脚本
   --admin-password <密码>  网页控制台管理员密码（默认随机生成）
   --admin-username <用户名> 网页控制台管理员用户名（默认 admin）
   --webui-listen <地址>    网页控制台监听地址，默认 0.0.0.0:8787（公网可访问）
+                           已经装过时只改现有配置里的这一项，线路与凭据不动
   --webui-allow-remote     确认允许控制台监听非回环地址（默认已开启）
                            只允许本机访问请用 --webui-listen 127.0.0.1:8787
-  --force-config       覆盖已存在的配置
+  --force-config       覆盖已存在的配置（会重新生成全部凭据）
   --skip-tune          跳过内核网络调优（BBR 等），不写 /etc/sysctl.d
 
 操作：
-  --menu               打开管理菜单（安装/更新、状态、凭据、重置密码、卸载）
+  --menu               打开管理菜单（安装/更新、状态、凭据、重置密码、卸载、
+                       控制台访问地址）
                        已经装过时，不带任何参数重新运行脚本也会进这个菜单
   --uninstall          彻底卸载（删除服务、二进制、配置与数据）
   --keep-data          卸载时保留配置与数据
@@ -850,6 +967,8 @@ PortTransit 一键脚本
 示例：
   sudo bash install.sh
   sudo bash install.sh --transport reality --port 443
+  sudo bash install.sh --webui-listen 0.0.0.0:8787   # 已装过：让控制台可用 服务器IP:8787 直接打开
+  sudo bash install.sh --webui-listen 127.0.0.1:8787 # 已装过：改回只允许本机
   sudo bash install.sh --menu
   sudo bash install.sh --uninstall
 EOF
@@ -869,6 +988,12 @@ ADMIN_USERNAME=""
 # 想只允许本机访问：--webui-listen 127.0.0.1:8787（外部访问走 SSH 隧道）。
 WEBUI_LISTEN="0.0.0.0:8787"
 WEBUI_ALLOW_REMOTE=1
+# 用户是否显式给了 --webui-listen。
+#
+# 默认值本身就是对外网开放的，但那只适用于「这次生成配置」的情况：已经装过
+# 的机器上配置文件会被原样保留，只有显式给参数时才去修改现有配置里的监听
+# 地址 —— 不能因为默认值就把别人特意设成仅本机的控制台改成公开。
+WEBUI_LISTEN_GIVEN=0
 # init 打印出来的明文凭据，供「安装完成」横幅复用。
 ADMIN_PASSWORD_SHOWN=""
 ADMIN_USERNAME_SHOWN=""
@@ -891,7 +1016,7 @@ while [[ $# -gt 0 ]]; do
     --name)            LINE_NAME="${2:?--name 需要一个值}"; shift 2 ;;
     --admin-password)  ADMIN_PASSWORD="${2:?--admin-password 需要一个值}"; shift 2 ;;
     --admin-username)  ADMIN_USERNAME="${2:?--admin-username 需要一个值}"; shift 2 ;;
-    --webui-listen)    WEBUI_LISTEN="${2:?--webui-listen 需要一个值}"; shift 2 ;;
+    --webui-listen)    WEBUI_LISTEN="${2:?--webui-listen 需要一个值}"; WEBUI_LISTEN_GIVEN=1; shift 2 ;;
     --webui-allow-remote) WEBUI_ALLOW_REMOTE=1; shift ;;
     --force-config)    FORCE_CONFIG=1; shift ;;
     --skip-tune)       SKIP_TUNE=1; shift ;;

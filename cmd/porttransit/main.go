@@ -16,6 +16,8 @@
 //	uninstall        remove everything the installer created
 //	reset-password   set a new management password
 //	show-credentials print the relay's connection details
+//	show-console     print the management console's address and username
+//	set-console      change the management console's listen address
 //	fingerprint      print a relay certificate's SHA-256 fingerprint
 //	deploy           install a relay on a remote host over SSH
 //	status           print the current configuration's summary
@@ -73,6 +75,8 @@ func main() {
 		err = install.ShowCredentials(rest)
 	case "show-console":
 		err = install.ShowConsole(rest)
+	case "set-console":
+		err = install.SetConsole(rest)
 	case "fingerprint":
 		err = install.Fingerprint(rest)
 	case "tune":
@@ -120,6 +124,7 @@ func usage() {
   reset-password    重置管理后台管理员密码
   show-credentials  打印中转服务端的连接凭据
   show-console      打印网页控制台的地址与用户名
+  set-console       修改网页控制台的监听地址（改成 0.0.0.0:8787 即可用 服务器IP:8787 直接访问）
   fingerprint       计算中转服务端证书的 SHA-256 指纹（用于客户端 certFingerprint）
   tune              应用内核网络调优（BBR 等），中转性能的关键
 
@@ -137,6 +142,8 @@ func usage() {
   porttransit fingerprint --cert /etc/porttransit/certs/relay.crt
   porttransit fingerprint --server relay.example.com:8443
   porttransit reset-password --config /etc/porttransit/config.json
+  porttransit set-console --listen 0.0.0.0:8787 --allow-remote   # 控制台外网可访问
+  porttransit set-console --listen 127.0.0.1:8787                # 改回仅本机
 `)
 }
 

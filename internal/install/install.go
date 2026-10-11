@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -492,6 +493,105 @@ func ShowConsole(args []string) error {
 	fmt.Printf("url=%s\n", ConsoleURL(cfg.WebUI.Listen, cfg.WebUI.TLS))
 	fmt.Printf("username=%s\n", cfg.WebUI.Username)
 	fmt.Printf("tls=%v\n", cfg.WebUI.TLS)
+	return nil
+}
+
+// SetConsole changes the management console's listen address in an existing
+// configuration, and touches nothing else.
+//
+// It exists because the address is decided by whoever writes the configuration
+// first, and every other path preserves an existing file: the one-click
+// installer keeps it, `install` keeps it, and the remote deployment keeps it so
+// that adding a relay line cannot move a console the operator is already using.
+// An operator who installed while the console was loopback-only, and later
+// wants to open it at http://<server-ip>:8787, would otherwise have to hand-edit
+// JSON whose validation refuses a public address without the acknowledgement
+// flag — and the feedback for getting it wrong is a service that will not start.
+//
+// Regenerating the configuration is not an alternative: --force-config rewrites
+// every credential, silently breaking every client already pointed at this
+// relay. Only the two fields that describe exposure are modified here; the
+// password, the username, the listeners and their credentials are carried
+// through untouched.
+func SetConsole(args []string) error {
+	fs := flag.NewFlagSet("set-console", flag.ContinueOnError)
+	var (
+		path        string
+		listen      string
+		allowRemote bool
+	)
+	fs.StringVar(&path, "config", ConfigPath, "配置文件路径")
+	fs.StringVar(&listen, "listen", "",
+		"新的监听地址：0.0.0.0:8787 可被外网访问，127.0.0.1:8787 仅本机")
+	fs.BoolVar(&allowRemote, "allow-remote", false,
+		"确认允许控制台监听非回环地址（等于把管理后台暴露在网络上）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if listen == "" {
+		return errors.New("set-console: 需要 --listen，例如 --listen 0.0.0.0:8787（外网可访问）")
+	}
+	// A bare host such as "0.0.0.0" is the typo that matters: it would be
+	// accepted here and only surface as a bind failure at the next start, long
+	// after the operator left the terminal. So is a nonsense port, which
+	// SplitHostPort does not reject on its own. The unix-socket form is exempt
+	// because it has no host and port to split.
+	if !strings.HasPrefix(listen, "/") && !strings.HasPrefix(listen, "@") {
+		_, port, err := net.SplitHostPort(listen)
+		if err != nil {
+			return fmt.Errorf("set-console: --listen %q 不是 主机:端口 形式（%v）", listen, err)
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("set-console: --listen %q 的端口无效，应为 1-65535", listen)
+		}
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// Exposing the console is opt-in and explicit, exactly as in `init`: the
+	// two commands must agree about what is required, or the installer's flag
+	// would work while the operator's own command line would not.
+	exposure := !config.IsLoopbackListen(listen)
+	if exposure && !allowRemote {
+		return fmt.Errorf(
+			"set-console: --listen %s 不是回环地址；把管理后台暴露到网络上必须显式加 --allow-remote", listen)
+	}
+	// Validate refuses a public console without a password. Catching it here
+	// names the command that fixes it instead of quoting a JSON key.
+	if exposure && cfg.WebUI.PasswordHash == "" {
+		return errors.New("set-console: 控制台还没有设置密码，暴露到网络上会被配置校验拒绝；先运行 porttransit reset-password")
+	}
+
+	previous := cfg.WebUI.Listen
+	cfg.WebUI.Listen = listen
+	// The acknowledgement tracks the address instead of accumulating: going
+	// back to loopback must not leave a remote bind pre-approved for whatever
+	// the next edit happens to be.
+	cfg.WebUI.AllowRemote = exposure
+
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+
+	fmt.Println("✔ 控制台监听地址已更新")
+	fmt.Printf("  配置文件：%s\n", path)
+	fmt.Printf("  原地址：%s\n", previous)
+	fmt.Printf("  新地址：%s\n", listen)
+	fmt.Printf("  网页控制台：%s\n", ConsoleURL(listen, cfg.WebUI.TLS))
+	if exposure {
+		fmt.Println("  控制台可被公网访问：请确保管理员密码足够强（登录失败会递增锁定）。")
+	} else {
+		fmt.Println("  控制台只监听本机：外部浏览器需要 SSH 隧道。")
+	}
+	if !cfg.WebUI.Enabled {
+		fmt.Println("  注意：配置里控制台是关闭的（webui.enabled=false），开启后这个地址才会生效。")
+	}
+	fmt.Println()
+	fmt.Println("如果服务正在运行，需要重启才能生效：")
+	fmt.Printf("  systemctl restart %s\n", UnitName)
 	return nil
 }
 

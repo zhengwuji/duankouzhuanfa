@@ -93,9 +93,10 @@ sudo bash install.sh --transport reality --port 443
 --name <名称>             线路名称，例如「上海中转」
 --admin-password <密码>   控制台管理员密码（默认随机生成）
 --admin-username <用户名> 控制台管理员用户名（默认 admin）
---webui-listen <地址>     控制台监听地址，默认 0.0.0.0:8787（公网可访问）
+--webui-listen <地址>     控制台监听地址，默认 0.0.0.0:8787（公网可访问）；
+                          已经装过时只改这一项，线路与凭据都不动
 --webui-allow-remote      确认允许控制台监听非回环地址（默认已开启）
---force-config            覆盖已存在的配置（默认保留旧配置）
+--force-config            覆盖已存在的配置（默认保留旧配置；会重新生成全部凭据）
 --skip-tune               跳过内核网络调优，不写 /etc/sysctl.d
 ```
 
@@ -105,6 +106,12 @@ sudo bash install.sh --transport reality --port 443
 > 只想本机访问就加 `--webui-listen 127.0.0.1:8787`，外部访问走 SSH 隧道：
 > `ssh -N -L 8787:127.0.0.1:8787 root@你的服务器`，然后打开 `http://127.0.0.1:8787`。
 > 服务器在 NAT 后面时，脚本会通过外部服务查出真实公网地址来拼这个链接。
+>
+> **已经装过、控制台却只有本机能打开**（旧版本的默认值是 `127.0.0.1:8787`）时
+> 不用重装：重跑脚本加 `--webui-listen 0.0.0.0:8787`、在管理菜单里选 `8`、或者
+> 直接 `sudo porttransit set-console --listen 0.0.0.0:8787 --allow-remote` 再
+> `systemctl restart porttransit`，三种改法等价，只动监听地址。改完用
+> `porttransit show-console` 确认，细节见「网页控制台 → 改成外网可访问」。
 
 其他操作：
 
@@ -140,6 +147,7 @@ sudo bash install.sh --uninstall --yes   # 卸载时不询问（脚本/自动化
   5) 重置控制台密码
   6) 重启服务
   7) 彻底卸载
+  8) 控制台访问地址（外网 / 仅本机）
   0) 退出
 ```
 
@@ -155,6 +163,9 @@ sudo bash install.sh --uninstall --yes   # 卸载时不询问（脚本/自动化
 
 > 重装或改协议时注意 `--force-config` 的默认行为：**不带它就会保留已有配置**，
 > 所以只改 `--transport` 而不加 `--force-config` 不会生效，看起来像参数没被读到。
+> 唯一的例外是 `--webui-listen`：它只改控制台监听地址，**会在现有配置上直接生效**，
+> 因为「把只有本机能打开的控制台改成外网可访问」不该逼用户去冒重新生成凭据的险。
+> 反过来，什么都不给时它也不会去动别人特意设成仅本机的控制台。
 
 > `--uninstall` 会删掉配置与数据，所以默认要输入 `yes` 确认。非交互环境
 > （CI、Ansible 等）请显式加 `--yes`，否则脚本会拒绝执行而不是默默删库。
@@ -318,7 +329,36 @@ HTTPS_PROXY=http://127.0.0.1:8118 curl https://ifconfig.me
 porttransit show-console        # 地址、用户名、是否启用
 porttransit show-credentials    # 中转凭据（客户端连接用）
 porttransit reset-password      # 换一个密码
+porttransit set-console         # 改监听地址（外网 / 仅本机）
 ```
+
+### 改成外网可访问（或改回仅本机）
+
+已经装好的机器不用重装，控制台监听地址可以单独改，改完就是
+`服务器IP:端口` 直接打开：
+
+```bash
+# 一键脚本（等价于安装时的 --webui-listen，只动监听地址）
+sudo bash install.sh --webui-listen 0.0.0.0:8787    # 外网可访问
+sudo bash install.sh --webui-listen 127.0.0.1:8787  # 改回仅本机
+sudo bash install.sh --menu                         # 或者在菜单里选 8
+
+# 或者直接对二进制说
+sudo porttransit set-console --listen 0.0.0.0:8787 --allow-remote
+sudo systemctl restart porttransit
+porttransit show-console                            # 确认新地址
+```
+
+三条路都只改配置文件里的 `webui.listen` 与 `webui.allowRemote`：**线路、管理员
+密码、客户端凭据全都不动**（想改协议/端口请用 `--force-config`，那才是重生成
+全部凭据的那条路）。几个行为细节：
+
+- 非回环地址必须显式带确认位（二进制的 `--allow-remote`、脚本的
+  `--webui-allow-remote`），否则会拒绝 —— 防止手滑把后台挂到公网上。
+- 脚本还会顺手把控制台端口加进防火墙；只用 `set-console` 的话记得自己放行。
+- 控制台还没有密码时不允许暴露（会被配置校验拒绝），先跑
+  `porttransit reset-password`。
+- 改完必须重启服务才生效；`set-console` 和脚本都会把这条命令打出来。
 
 ### 安全设计
 
@@ -326,6 +366,8 @@ porttransit reset-password      # 换一个密码
   打开 `allowRemote` **并且**设置密码，否则配置校验会直接拒绝启动。
   **一键脚本刻意把默认值改成 `0.0.0.0:8787`**，因为装完就想直接打开控制台；
   它会在结果横幅里明确警告并把改回本机的方法打出来。
+  旧版本装好的机器（控制台还是 `127.0.0.1:8787`）用
+  `set-console` / `install.sh --webui-listen` / 菜单 `8` 切换，不用重装。
 - 登录失败按来源地址递增锁定：前 5 次不惩罚（密码管理器也会打错），之后
   每次翻倍，最长 15 分钟。计数在成功登录后清零，15 分钟无失败也会过期。
   **按来源隔离**，所以一个攻击者无法把运维锁在外面。
@@ -349,6 +391,7 @@ porttransit install          安装为系统服务（需要 root）
 porttransit uninstall        彻底卸载
 porttransit reset-password   重置管理员密码
 porttransit show-console     打印控制台地址与用户名
+porttransit set-console      修改控制台监听地址（外网 / 仅本机）
 porttransit show-credentials 打印中转凭据
 
 porttransit tune             应用内核网络调优（BBR 等）
@@ -377,6 +420,9 @@ porttransit run --config ./config.json --log-level debug --log-file -
 # 远程部署，装完直接写进客户端配置
 porttransit deploy --host 1.2.3.4 --user root --transport tls \
   --port 8443 --add-to ./client.json
+
+# 让控制台可以用 服务器IP:8787 直接打开（只改监听地址，凭据不动）
+porttransit set-console --listen 0.0.0.0:8787 --allow-remote
 ```
 
 ### 跨平台远程部署
