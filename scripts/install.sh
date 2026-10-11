@@ -12,6 +12,8 @@
 #   bash install.sh --uninstall              彻底卸载
 #   bash install.sh --reset-password         重置管理后台密码
 #   bash install.sh --status                 查看运行状态
+#   bash install.sh                          已经装过时先进管理菜单（选 1 即安装/更新）
+#   bash install.sh --yes --transport tls    在终端里跳过菜单，直接按参数执行
 #
 # 该脚本只做四件事：安装依赖、放置二进制、生成配置、注册系统服务。
 # 所有配置逻辑都在 porttransit 二进制内部，脚本不复制它的判断。
@@ -445,13 +447,14 @@ show_result() {
     printf '  %s彻底卸载%s  %s uninstall --yes\n' "${BOLD}" "${RESET}" "${BIN_PATH}" >&2
     printf '              或用脚本卸载：curl -fsSL %s | bash -s -- --uninstall\n' "${SCRIPT_URL}" >&2
   fi
-  # 提示菜单的存在：用户的习惯是重跑那条带参数的安装命令，而带参数时不进
-  # 菜单（否则自动化脚本会被卡住），所以必须主动告诉他们怎么打开。
+  # 提示菜单的存在：已装过的机器上再运行一次本脚本就会先进管理菜单（菜单里
+  # 选 1 就是安装/更新），所以这里直接把这件事说出来，不要求用户记住 --menu。
   if [[ -n "${SCRIPT_PATH}" ]]; then
-    printf '  %s管理菜单%s  bash %s --menu\n' "${BOLD}" "${RESET}" "${SCRIPT_PATH}" >&2
+    printf '  %s管理菜单%s  再运行一次本脚本就会进菜单（bash %s --menu 可直达）\n' \
+      "${BOLD}" "${RESET}" "${SCRIPT_PATH}" >&2
   else
-    printf '  %s管理菜单%s  curl -fsSL %s | bash -s -- --menu\n' \
-      "${BOLD}" "${RESET}" "${SCRIPT_URL}" >&2
+    printf '  %s管理菜单%s  再运行一次上面的命令就会进菜单（加 --menu 可直达）\n' \
+      "${BOLD}" "${RESET}" >&2
   fi
   echo >&2
 
@@ -951,10 +954,11 @@ PortTransit 一键脚本
 操作：
   --menu               打开管理菜单（安装/更新、状态、凭据、重置密码、卸载、
                        控制台访问地址）
-                       已经装过时，不带任何参数重新运行脚本也会进这个菜单
+                       已经装过的机器上重新运行本脚本也会先进这个菜单
   --uninstall          彻底卸载（删除服务、二进制、配置与数据）
   --keep-data          卸载时保留配置与数据
-  --yes, -y            不询问，直接确认卸载（非交互环境必须加）
+  --yes, -y            不询问、不进菜单，直接执行（非交互环境必须加）
+                       在终端里用它跳过管理菜单，例如：--yes --transport tls
   --reset-password     重置管理后台密码
   --status             查看运行状态
 
@@ -1003,12 +1007,8 @@ KEEP_DATA=0
 ASSUME_YES=0
 SKIP_TUNE=0
 ACTION="install"
-# 是否有任何参数被显式给出。没有任何参数且已安装时进菜单；只要给了参数就按
-# 参数执行，自动化脚本因此完全不受菜单影响。
-ARGS_GIVEN=0
 
 while [[ $# -gt 0 ]]; do
-  ARGS_GIVEN=1
   case "$1" in
     --transport)       TRANSPORT="${2:?--transport 需要一个值}"; shift 2 ;;
     --port)            PORT="${2:?--port 需要一个值}"; shift 2 ;;
@@ -1045,13 +1045,16 @@ fi
 
 case "${ACTION}" in
   install)
-    # 重跑（不带任何参数、且在终端里）时给菜单：装完之后最常见的动作是查看
-    # 状态、取凭据、改密码，而不是重装。带参数时行为完全不变，所以
-    # `curl … | bash -s -- --transport tls --port 8443` 这类用法不受影响。
-    if [[ "${ARGS_GIVEN}" -eq 0 ]] && [[ -x "${BIN_PATH}" ]] && has_terminal; then
-      do_menu
-    else
+    # 已经装过的机器 + 在终端里运行：一律先进管理菜单，带不带参数都一样 ——
+    # 要的就是「运行安装命令，每次都先看到菜单，再决定是安装/更新还是看状态」。
+    # 参数不会丢：在菜单里选 1，执行的就是这次带着参数的安装/更新。
+    #
+    # 三种情况仍然直接执行：还没装（第一次就该一路装完）、非交互（管道、cron，
+    # 卡在菜单上等于坏掉）、显式给了 --yes（明确表示别问我）。
+    if [[ ! -x "${BIN_PATH}" ]] || [[ "${ASSUME_YES}" -eq 1 ]] || ! has_terminal; then
       do_install
+    else
+      do_menu
     fi
     ;;
   uninstall)      do_uninstall ;;

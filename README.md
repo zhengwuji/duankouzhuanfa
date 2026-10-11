@@ -121,13 +121,14 @@ sudo bash install.sh --reset-password    # 重置控制台密码（随机生成�
 sudo bash install.sh --reset-password --admin-password '你的新密码'
 sudo bash install.sh --uninstall         # 彻底卸载（含配置与数据）
 sudo bash install.sh --uninstall --keep-data   # 卸载但保留配置
-sudo bash install.sh --uninstall --yes   # 卸载时不询问（脚本/自动化里必须加）
+sudo bash install.sh --uninstall --yes   # 卸载时不询问，也不进菜单（自动化里必须加）
 ```
 
 ### 管理菜单
 
-装完之后最常见的动作是查看状态、取凭据、改密码，而不是重装。**已经装过时，
-不带任何参数重新运行脚本会打开管理菜单**：
+装完之后最常见的动作是查看状态、取凭据、改密码，而不是重装。**已经装过的机器
+重新运行脚本会先进管理菜单**（带不带参数都一样，想在菜单里选 1 安装/更新就直接
+选）：
 
 ```
 ╭──────────────────────────────────────────────╮
@@ -153,9 +154,10 @@ sudo bash install.sh --uninstall --yes   # 卸载时不询问（脚本/自动化
 
 也可以显式打开：`sudo bash install.sh --menu`。
 
-> **只要带了任何参数就不会进菜单**，行为与以前完全一致。所以
-> `curl … | bash -s -- --transport tls --port 8443` 这类自动化调用不会被
-> 提示卡住；没有终端（CI、cron、重定向）时同样不进菜单。
+> **已经装过的机器 + 终端里运行，就一定会先进菜单**（带不带参数都一样），这样
+> 「运行安装命令」永远是从菜单里选一次，而不是靠记参数。要在终端里跳过菜单、
+> 直接按参数执行，加 `--yes`：`curl … | bash -s -- --yes --transport tls --port 8443`。
+> 没有终端（CI、cron、重定向）时不会进菜单 —— 卡在菜单上等于坏掉。
 >
 > 菜单的输入一律读 `/dev/tty` 而不是 stdin。因为文档里的主要用法是
 > `curl … | bash`，那时 **stdin 就是脚本自身** —— 从 stdin 读会把后面的
